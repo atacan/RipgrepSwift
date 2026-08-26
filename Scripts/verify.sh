@@ -17,6 +17,12 @@ echo "==> cargo test"
 echo "==> build XCFramework"
 "$SCRIPT_DIR/build-xcframework.sh"
 
+# Swift steps resolve CRipgrep from the freshly built framework instead of
+# downloading the GitHub Release asset. SwiftPM requires the path to be
+# relative to the package root.
+cd "$SCRIPT_DIR/.."
+export RIPGREP_XCFRAMEWORK_PATH="Artifacts/CRipgrep.xcframework"
+
 echo "==> swift build"
 swift build
 

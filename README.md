@@ -27,20 +27,30 @@ dependencies: [
 ]
 ```
 
-The package ships a committed `Artifacts/CRipgrep.xcframework` containing the
-compiled Rust code (macOS arm64 + x86_64), so consuming projects build
-without a Rust toolchain.
+The default package manifest resolves the compiled Rust code (macOS arm64 +
+x86_64) from a GitHub Release asset, so consuming projects build without a
+Rust toolchain. To build against a locally built XCFramework instead, set
+`RIPGREP_XCFRAMEWORK_PATH` (see [Building the native library](#building-the-native-library)).
 
 ## API
 
 ### `Ripgrep.search(_:in:options:)`
 
-Returns an `AsyncThrowingStream<RipgrepMatch, Error>`. The native search runs
-on a background task; matches are delivered serially as they are discovered —
-results are streamed, never accumulated up front.
+Returns a `RipgrepSearchResults: AsyncSequence`. The native search runs on a
+background task; matches are delivered serially as they are discovered.
+
+Delivery is **strictly backpressured**: the native filesystem search is
+parked between consumer requests and cannot advance until your code asks for
+the next match (`for try await`). At most one produced match is ever
+buffered, so memory use stays constant regardless of tree size or result
+count — nothing accumulates.
 
 A line containing several regex matches produces one `RipgrepMatch` per
 match, all sharing the same `lineNumber` and `line`.
+
+The sequence supports exactly **one** consuming iterator (single pass), like
+most streaming APIs. Calling its iterator again yields `nil`; create a new
+search to run again.
 
 ### `RipgrepMatch`
 
@@ -92,11 +102,14 @@ C status codes are never exposed.
   dotfiles and dot-directories (including `.git` contents, like `rg --hidden`).
 - **Binary files**: once a NUL byte is observed in a file (ripgrep's default
   "quit" detection), searching that file stops silently.
-- **Cancellation**: stopping iteration (`break`) or cancelling the consuming
-  task stops the native search as soon as practical. Cancellation is not
-  reported as an error.
-- **Concurrency**: one search delivers results serially. Independent searches
-  may run concurrently; there is no shared mutable state between searches.
+- **Cancellation**: stopping iteration (`break`), cancelling the consuming
+  task, dropping the sequence, or calling `cancel()` explicitly stops the
+  native search as soon as practical. Because delivery is pull-based, an
+  abandoned search is parked at its next match and unwinds without scanning
+  the rest of the tree. Cancellation is never reported as an error.
+- **Concurrency**: one search delivers results serially to a single
+  consumer. Independent searches may run concurrently; there is no shared
+  mutable state between searches.
 - **Paths**: v1 supports paths representable as UTF-8 via `URL`. Paths Rust
   discovers that are not valid UTF-8 are skipped rather than corrupted.
 - **Unreadable files**: individual traversal/read errors are skipped so one
@@ -110,6 +123,12 @@ fixed-string matching, PCRE2, replacement, glob/type filters, context lines,
 multiline patterns, archive searching, parallel traversal, and JSON output
 are not available yet.
 
+## Reproducible native builds
+
+The Rust toolchain is pinned via `Native/ripgrep-ffi/rust-toolchain.toml`,
+and `Cargo.lock` is committed, so release artifacts build reproducibly. CI
+installs the same pinned toolchain.
+
 ## Building the native library
 
 Only needed when changing the Rust code:
@@ -122,22 +141,50 @@ Requirements: Rust with the `aarch64-apple-darwin` and
 `x86_64-apple-darwin` targets (`rustup target add ...` is performed by the
 script automatically) and Xcode's command line tools.
 
+The script creates `Artifacts/CRipgrep.xcframework`. `Artifacts/` is never
+committed to git — the binary is distributed as a GitHub Release asset.
+
+To build this package against your freshly built framework, point SwiftPM at
+it with the environment variable:
+
+```bash
+RIPGREP_XCFRAMEWORK_PATH=Artifacts/CRipgrep.xcframework swift build
+```
+
+Without the variable, the manifest downloads the released zip.
+
 ## Development
 
 ```bash
 ./Scripts/build-xcframework.sh   # rebuild Artifacts/CRipgrep.xcframework
-swift test                       # Swift test suite
+RIPGREP_XCFRAMEWORK_PATH=Artifacts/CRipgrep.xcframework swift test
 
 cd Native/ripgrep-ffi
 cargo test                       # Rust test suite
 cargo clippy && cargo fmt --check
 ```
 
-Or run everything at once:
+Or run everything at once (builds the framework, exports the env var, runs
+all checks):
 
 ```bash
 ./Scripts/verify.sh
 ```
+
+## GitHub Releases
+
+The XCFramework is published as a release asset so consumers never need
+Rust installed:
+
+```bash
+./Scripts/build-xcframework.sh
+./Scripts/package-release.sh 0.1.0 atacan/RipgrepSwift
+gh release create 0.1.0 Release/CRipgrep.xcframework.zip --title "0.1.0"
+```
+
+`package-release.sh` prints the SwiftPM checksum; it must match the
+`checksum:` in `Package.swift`. Release asset URLs are immutable — do not
+replace the zip behind an existing tag without updating `Package.swift`.
 
 ## Architecture
 

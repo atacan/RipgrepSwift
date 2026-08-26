@@ -111,56 +111,228 @@ enum SearchBridge {
                 matchStart: cMatch.match_start,
                 matchEnd: cMatch.match_end
             )
-            return context.emit(match)
+            return context.session.deliver(match, from: context)
         }
 }
 
-/// State shared between the async stream machinery and the synchronous
-/// native search. Access from multiple threads is guarded by a lock.
-final class SearchContext: @unchecked Sendable {
+/// Internal instrumentation describing what actually happened on the
+/// native side of one search. Exposed for tests via
+/// ``Ripgrep/searchWithStatistics(_:in:options:)`` so cancellation behavior
+/// can be verified beyond what the consumer receives.
+final class SearchStatistics: @unchecked Sendable {
     private let lock = NSLock()
-    private var cancelled = false
-    private let continuation: AsyncThrowingStream<RipgrepMatch, Error>.Continuation
+    private var _deliveredMatchCount = 0
+    private var _finished = false
 
-    init(continuation: AsyncThrowingStream<RipgrepMatch, Error>.Continuation) {
-        self.continuation = continuation
+    /// Number of times the native layer invoked the match callback,
+    /// whether or not the consumer ultimately observed each match.
+    var deliveredMatchCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return _deliveredMatchCount
     }
 
-    /// Marks the search as cancelled; the native callback will report
-    /// `false` at (or before) its next invocation.
-    func requestCancellation() {
+    /// True once the native search has fully unwound (completed, been
+    /// cancelled, or failed).
+    var isFinished: Bool {
         lock.lock()
-        cancelled = true
+        defer { lock.unlock() }
+        return _finished
+    }
+
+    func recordNativeCallback() {
+        lock.lock()
+        _deliveredMatchCount += 1
         lock.unlock()
     }
 
-    private var isCancelled: Bool {
+    func markFinished() {
         lock.lock()
-        defer { lock.unlock() }
-        return cancelled || Task.isCancelled
+        _finished = true
+        lock.unlock()
     }
+}
 
-    /// Delivers one match to the stream. Returns whether the native search
-    /// should continue.
-    func emit(_ match: RipgrepMatch) -> Bool {
-        if isCancelled {
-            return false
+/// State shared between the async sequence machinery and the synchronous
+/// native search.
+///
+/// The session implements strict consumer backpressure: the native callback
+/// parks inside `deliver(match:)` until the consumer has asked for another
+/// element, so the native search can never outrun consumption and at most
+/// one produced match is ever buffered.
+///
+/// Access from multiple threads is guarded by a single `NSCondition`.
+final class SearchSession: @unchecked Sendable {
+
+    // MARK: State guarded by `condition`
+
+    private let condition = NSCondition()
+    private var waiter: CheckedContinuation<Result<RipgrepMatch?, Error>, Never>?
+    private var finished = false
+    private var failure: Error?
+    private var consumerRequestedCancellation = false
+
+    // MARK: Consumer liveness
+
+    /// Identity token held strongly by the live iterator. When every
+    /// consumer-side structure has been released (break, dropped sequence,
+    /// cancelled task), this weak reference dies and the parked producer
+    /// aborts the native search instead of waiting forever.
+    final class ConsumerToken: Sendable {}
+
+    private weak var consumerToken: ConsumerToken?
+    private var tokenClaimed = false
+
+    /// Hands out the single consumer token. A session supports exactly one
+    /// consuming iterator; a second claim returns nil.
+    func claimConsumerToken() -> ConsumerToken? {
+        condition.lock()
+        defer { condition.unlock() }
+        if tokenClaimed {
+            return nil
         }
-        switch continuation.yield(match) {
-        case .enqueued:
-            return !isCancelled
-        case .dropped, .terminated:
-            return false
-        @unknown default:
-            return false
+        tokenClaimed = true
+        let token = ConsumerToken()
+        consumerToken = token
+        return token
+    }
+
+    private var consumerIsAlive: Bool {
+        consumerToken != nil || !tokenClaimed
+    }
+
+    // MARK: Producer side (called from the native callback thread)
+
+    /// Parks until the consumer is waiting for another element, then hands
+    /// over `match` by resuming it. Returns whether the native search should
+    /// continue.
+    func deliver(_ match: RipgrepMatch, from context: SearchContext) -> Bool {
+        // Every native callback counts, even ones that end up suppressed.
+        context.statistics.recordNativeCallback()
+
+        while true {
+            condition.lock()
+            if consumerRequestedCancellation || finished || !consumerIsAlive {
+                condition.unlock()
+                return false
+            }
+            if let waitingConsumer = waiter {
+                waiter = nil
+                condition.unlock()
+                waitingConsumer.resume(returning: .success(match))
+                return true
+            }
+            // No consumer is waiting: park. Backpressure means the search
+            // makes no progress at all until `next()` is called again.
+            // Bounded waits re-check liveness so an abandoned consumer
+            // cannot park the producer forever.
+            _ = condition.wait(until: .now.addingTimeInterval(0.1))
+            condition.unlock()
         }
     }
 
-    func finish() {
-        continuation.finish()
+    /// Called by the producer task after the native search fully unwound.
+    /// Wakes any parked consumer so iteration can end.
+    func finish(with error: Error?) {
+        condition.lock()
+        finished = true
+        failure = error
+        let parkedConsumer = waiter
+        waiter = nil
+        let outcome: Result<RipgrepMatch?, Error> = error.map { .failure($0) } ?? .success(nil)
+        condition.unlock()
+        parkedConsumer?.resume(returning: outcome)
     }
 
-    func finish(throwing error: Error) {
-        continuation.finish(throwing: error)
+    // MARK: Consumer side
+
+    /// Returns the next match, or nil when the search ended (completed or
+    /// cancelled). Throws on native failures.
+    func next() async throws -> RipgrepMatch? {
+        // Fast path without parking.
+        if let immediate = poll() {
+            return try immediate.get()
+        }
+
+        let outcome: Result<RipgrepMatch?, Error> = await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Result<RipgrepMatch?, Error>, Never>) in
+                switch registerWaiter(continuation) {
+                case .registered:
+                    break
+                case .immediate(let outcome):
+                    continuation.resume(returning: outcome)
+                }
+            }
+        } onCancel: { [self] in
+            // Task cancellation ends iteration silently (like
+            // AsyncThrowingStream) and stops the native search.
+            abortWaiter()
+        }
+        return try outcome.get()
+    }
+
+    private enum WaitOutcome {
+        case registered
+        case immediate(Result<RipgrepMatch?, Error>)
+    }
+
+    /// Synchronously checks whether an element/end is already available;
+    /// otherwise registers the continuation for the producer to resume.
+    private func pollOrRegister(_ continuation: CheckedContinuation<Result<RipgrepMatch?, Error>, Never>) -> WaitOutcome {
+        precondition(waiter == nil, "SearchSession supports one concurrent next() call")
+        if !finished && failure == nil && !consumerRequestedCancellation {
+            waiter = continuation
+            condition.broadcast()
+            return .registered
+        }
+        if let error = failure {
+            return .immediate(.failure(error))
+        }
+        return .immediate(.success(nil))
+    }
+
+    /// Brief-lock check used before suspending.
+    private func poll() -> Result<RipgrepMatch?, Error>? {
+        condition.lock()
+        defer { condition.unlock() }
+        if finished || consumerRequestedCancellation {
+            return failure.map { .failure($0) } ?? .success(nil)
+        }
+        return nil
+    }
+
+    private func registerWaiter(_ continuation: CheckedContinuation<Result<RipgrepMatch?, Error>, Never>) -> WaitOutcome {
+        condition.lock()
+        defer { condition.unlock() }
+        return pollOrRegister(continuation)
+    }
+
+    /// Resumes any suspended `next()` with nil and requests cancellation of
+    /// the native search. Safe to call multiple times.
+    private func abortWaiter() {
+        condition.lock()
+        consumerRequestedCancellation = true
+        let parkedConsumer = waiter
+        waiter = nil
+        condition.unlock()
+        parkedConsumer?.resume(returning: .success(nil))
+    }
+
+    /// Requests that the native search stop as soon as practical and wakes
+    /// any suspended `next()` with nil. Safe to call multiple times.
+    func stop() {
+        abortWaiter()
+    }
+}
+
+/// The object passed through the C ABI as the callback context. It only
+/// glues the opaque pointer back onto the session and statistics.
+final class SearchContext: @unchecked Sendable {
+    let session: SearchSession
+    let statistics: SearchStatistics
+
+    init(session: SearchSession, statistics: SearchStatistics) {
+        self.session = session
+        self.statistics = statistics
     }
 }

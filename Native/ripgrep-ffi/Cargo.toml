@@ -9,7 +9,12 @@ name = "ripgrep_ffi"
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
-grep = "0.4"
+# Only the matcher/searcher slice of ripgrep is needed; depending on the
+# subcrates directly keeps grep-printer/grep-cli (and their trees) out of
+# the shipped static library.
+grep-matcher = "0.1"
+grep-regex = "0.1"
+grep-searcher = "0.1"
 ignore = "0.4"
 
 [dev-dependencies]
@@ -18,3 +23,5 @@ tempfile = "3"
 [profile.release]
 lto = true
 codegen-units = 1
+# Drop DWARF but keep the symbol table so the static library stays linkable.
+strip = "debuginfo"

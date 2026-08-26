@@ -6,3 +6,7 @@
 
 # Rust
 Native/ripgrep-ffi/target/
+
+# Binary artifacts are distributed as GitHub Release assets, never in git.
+Artifacts/
+Release/

@@ -33,10 +33,10 @@ enum TestFixture {
 
 /// Collects an entire search into an array. Tests that need streaming or
 /// cancellation semantics iterate manually instead.
-func collectAll(_ stream: AsyncThrowingStream<RipgrepMatch, Error>) async throws -> [RipgrepMatch] {
-    var results: [RipgrepMatch] = []
-    for try await match in stream {
-        results.append(match)
+func collectAll(_ results: RipgrepSearchResults) async throws -> [RipgrepMatch] {
+    var collected: [RipgrepMatch] = []
+    for try await match in results {
+        collected.append(match)
     }
-    return results
+    return collected
 }

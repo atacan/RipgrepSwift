@@ -1,4 +1,0 @@
-module CRipgrep {
-    header "ripgrep_ffi.h"
-    export *
-}

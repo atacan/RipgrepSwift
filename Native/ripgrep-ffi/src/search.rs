@@ -9,9 +9,9 @@ use std::cell::Cell;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 
-use grep::matcher::{Match, Matcher};
-use grep::regex::RegexMatcherBuilder;
-use grep::searcher::{BinaryDetection, SearcherBuilder, Sink, SinkMatch};
+use grep_matcher::{Match, Matcher};
+use grep_regex::RegexMatcherBuilder;
+use grep_searcher::{BinaryDetection, SearcherBuilder, Sink, SinkMatch};
 use ignore::WalkBuilder;
 
 /// Configuration for a single search run.
@@ -172,7 +172,7 @@ where
 
     fn matched(
         &mut self,
-        _searcher: &grep::searcher::Searcher,
+        _searcher: &grep_searcher::Searcher,
         mat: &SinkMatch<'_>,
     ) -> Result<bool, Self::Error> {
         let line = strip_line_terminator(mat.bytes());
