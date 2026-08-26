@@ -1,0 +1,38 @@
+name: Release verification
+
+# The normal push CI verifies the freshly built local XCFramework via
+# RIPGREP_XCFRAMEWORK_PATH. This workflow additionally verifies what a real
+# SwiftPM consumer sees with no environment override: source from the
+# repository ref plus the binary downloaded from the GitHub Release asset.
+# It runs on published releases and can be triggered manually.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Repository ref whose Package.swift/release asset to verify"
+        required: false
+        default: ""
+
+jobs:
+  remote-binary-consumer:
+    name: Remote binary consumer
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.0"
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Verify remote release binary as a fresh consumer
+        env:
+          REF: ${{ github.event.release.tag_name || inputs.ref }}
+        run: ./Scripts/verify-release-consumer.sh "$REF"

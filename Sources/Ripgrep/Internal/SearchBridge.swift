@@ -332,9 +332,8 @@ final class SearchSession: @unchecked Sendable {
         phase = .running
         statistics.recordProducerStarted()
 
-        // Failure to allocate a native token degrades gracefully: the
-        // search still runs, it just cannot be cancelled natively before
-        // its next backpressure wake-up. In practice this never happens.
+        // `rg_cancel_token_create` returns a non-null owned token on normal
+        // return; it is freed exactly once in `finish(with:)`.
         nativeCancelToken = rg_cancel_token_create()
 
         let context = SearchContext(session: self, statistics: statistics)

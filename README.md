@@ -22,7 +22,7 @@ for try await match in Ripgrep.search("TODO|FIXME", in: root) {
 dependencies: [
     .package(
         url: "https://github.com/atacan/RipgrepSwift.git",
-        from: "0.1.0"
+        from: "0.1.1"
     )
 ]
 ```
@@ -207,17 +207,36 @@ Rust installed:
 gh release create 0.1.1 Release/CRipgrep.xcframework.zip --title "0.1.1"
 ```
 
-`package-release.sh` prints the SwiftPM checksum. **Release checklist:**
+`package-release.sh` prints the SwiftPM checksum. **Release checklist** (in
+this order, so `Package.swift` only ever references an asset that exists):
 
-1. Build and package the zip (commands above).
-2. Create the GitHub release with the zip attached.
+1. Verify everything locally: `./Scripts/verify.sh`.
+2. Build and package the zip (commands above) and note the checksum.
 3. Update the `url:`/`checksum:` in `Package.swift` to the new tag and
-   printed checksum — release asset URLs are immutable, so this must only
-   happen after the release exists.
-4. Bump the installation snippet in this README to the new version.
+   printed checksum, and bump the installation snippet in this README.
+4. Commit that release-ready source state and tag it.
+5. Create the GitHub release with exactly the zip that was checksummed —
+   release assets are immutable once consumers have cached the checksum.
+6. Run `./Scripts/verify-release-consumer.sh <tag>` to verify a fresh,
+   cache-free consumer resolves the remote binary, links it, and runs a
+   real search with no environment override.
 
-Until those steps run, `Package.swift` keeps pointing at the published
-`0.1.0` asset; development builds use `RIPGREP_XCFRAMEWORK_PATH`.
+## Verifying the released binary
+
+Development builds test against a freshly built local XCFramework (see
+above). To verify what a real SwiftPM consumer downloads instead:
+
+```bash
+./Scripts/verify-release-consumer.sh 0.1.1
+```
+
+This creates a fresh temporary executable package depending on this repo at
+the given ref, requires that `RIPGREP_XCFRAMEWORK_PATH` is unset, lets
+SwiftPM download the GitHub Release XCFramework named by `Package.swift`,
+checks the downloaded binary exports the current ABI symbols, compiles
+against it, runs a real search consuming results, exercises cancellation,
+and fails on any problem. It also runs automatically for published
+releases via the `Release verification` GitHub Actions workflow.
 
 ## Architecture
 

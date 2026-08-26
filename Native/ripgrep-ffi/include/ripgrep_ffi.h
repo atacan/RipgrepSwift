@@ -69,15 +69,16 @@ typedef enum rg_status {
 /*
  * Opaque cancellation token, owned by the caller.
  *
- * Create with rg_cancel_token_create and release with
- * rg_cancel_token_free exactly once. A token must outlive every rg_search
- * call that received it; freeing a token while a search is still using it
- * is a caller error. The token may be cancelled from any thread while a
- * search is in flight; cancellation is atomic and idempotent.
+ * Release with rg_cancel_token_free exactly once. A token must outlive
+ * every rg_search call that received it; freeing a token while a search is
+ * still using it is a caller error. The token may be cancelled from any
+ * thread while a search is in flight; cancellation is atomic and
+ * idempotent.
  */
 typedef struct rg_cancel_token rg_cancel_token_t;
 
-/* Creates a cancellation token. Returns NULL only on allocation failure. */
+/* Creates a new owned cancellation token. On normal return the returned
+ * pointer is non-null. */
 rg_cancel_token_t *rg_cancel_token_create(void);
 
 /*

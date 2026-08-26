@@ -9,7 +9,7 @@ ARTIFACTS_DIR="$ROOT_DIR/Artifacts"
 RELEASE_DIR="$ROOT_DIR/Release"
 XCFRAMEWORK="$ARTIFACTS_DIR/CRipgrep.xcframework"
 ZIP_PATH="$RELEASE_DIR/CRipgrep.xcframework.zip"
-VERSION="${1:-0.1.0}"
+VERSION="${1:-0.1.1}"
 REPOSITORY="${2:-atacan/RipgrepSwift}"
 ASSET_URL="https://github.com/$REPOSITORY/releases/download/$VERSION/CRipgrep.xcframework.zip"
 

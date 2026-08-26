@@ -98,7 +98,8 @@ pub struct rg_cancel_token {
 
 static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
 
-/// Creates a cancellation token. Returns NULL only on allocation failure.
+/// Creates a new owned cancellation token. On normal return the token is
+/// non-null; the caller owns it.
 ///
 /// Ownership: the caller owns the returned token and must release it with
 /// [`rg_cancel_token_free`] exactly once. A token must outlive every call

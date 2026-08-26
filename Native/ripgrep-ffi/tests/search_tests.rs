@@ -326,18 +326,36 @@ fn preset_cancel_flag_stops_search_before_any_match() {
 
 #[test]
 fn external_cancel_flag_stops_running_search_between_and_within_files() {
+    // Enough data that the search is still running while we synchronize:
+    // several multi-megabyte files with matches, so cancellation can land
+    // both between files and inside the current one.
+    let mut contents = String::new();
+    for index in 0..200_000 {
+        contents.push_str(&format!("filler {index} needle here\n"));
+    }
     let root = fixture(&[
-        ("a.txt", "needle a\n"),
-        ("b.txt", "needle b\n"),
-        ("c.txt", "no match here\n"),
-        ("d.txt", "needle d\n"),
+        ("big_a.txt", contents.as_str()),
+        ("big_b.txt", contents.as_str()),
+        ("big_c.txt", contents.as_str()),
     ]);
+    let total_bytes: u64 = ["big_a.txt", "big_b.txt", "big_c.txt"]
+        .iter()
+        .map(|name| std::fs::metadata(root.path().join(name)).unwrap().len())
+        .sum();
 
     let cancel = std::sync::Arc::new(AtomicBool::new(false));
+    let bytes_seen = std::sync::Arc::new(AtomicU64::new(0));
+
+    // Deterministic handshake instead of a timing guess: a helper thread
+    // sets the flag only once the progress callback proves the search is
+    // actively reading data.
     let canceller = {
         let cancel = cancel.clone();
+        let bytes_seen = bytes_seen.clone();
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(1));
+            while bytes_seen.load(Ordering::Acquire) == 0 {
+                std::thread::sleep(Duration::from_micros(100));
+            }
             cancel.store(true, Ordering::Release);
         })
     };
@@ -352,13 +370,24 @@ fn external_cancel_flag_stops_running_search_between_and_within_files() {
             seen += 1;
             ControlFlow::Continue(())
         },
-        |_| {},
+        |progress: SearchProgress| {
+            bytes_seen.store(progress.bytes_searched, Ordering::Release);
+        },
     )
     .expect("search runs");
 
     canceller.join().expect("canceller");
+
     assert_eq!(outcome, SearchOutcome::Cancelled);
-    assert!(seen < 4, "search must not have completed: {seen}");
+    // The decisive assertion: the flag landed while the search was running,
+    // so not all input was processed. Only an in-flight cancellation can
+    // produce this for a completed traversal loop.
+    let final_bytes = bytes_seen.load(Ordering::Acquire);
+    assert!(
+        final_bytes < total_bytes,
+        "cancelled after {final_bytes} of {total_bytes} bytes"
+    );
+    assert!(seen > 0, "matches must have been delivered before cancel");
 }
 
 #[test]
