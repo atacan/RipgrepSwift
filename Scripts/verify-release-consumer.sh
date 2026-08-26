@@ -12,9 +12,15 @@
 # Usage: Scripts/verify-release-consumer.sh [ref]  (default: 0.1.1)
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REF="${1:-0.1.1}"
 REPO_URL="https://github.com/atacan/RipgrepSwift.git"
+FIXTURE="$SCRIPT_DIR/release-consumer/main.swift"
 
+if [[ ! -f "$FIXTURE" ]]; then
+    echo "FAIL: consumer fixture not found at $FIXTURE" >&2
+    exit 1
+fi
 if [[ -n "${RIPGREP_XCFRAMEWORK_PATH:-}" ]]; then
     echo "FAIL: RIPGREP_XCFRAMEWORK_PATH is set to '$RIPGREP_XCFRAMEWORK_PATH'." >&2
     echo "This verification must exercise the remote GitHub Release binary; unset it." >&2
@@ -49,37 +55,7 @@ let package = Package(
 )
 EOF
 
-cat > "$CONSUMER/Sources/Consumer/main.swift" <<'EOF'
-import Foundation
-import Ripgrep
-
-// Fixture with several matches spread across multiple files.
-let root = FileManager.default.temporaryDirectory
-    .appendingPathComponent("rg-release-consumer-\(UUID().uuidString)", isDirectory: true)
-try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-defer { try? FileManager.default.removeItem(at: root) }
-for index in 0..<3 {
-    let lines = (0..<20_000).map { "line \($0) needle here\n" }.joined()
-    try Data(lines.utf8).write(to: root.appendingPathComponent("file\(index).txt"))
-}
-
-// 1. A real search whose results are actually consumed.
-var count = 0
-for try await match in Ripgrep.search("needle", in: root) {
-    precondition(match.line.contains("needle"), "unexpected line: \(match.line)")
-    count += 1
-    if count == 100 { break }
-}
-precondition(count == 100, "expected to consume 100 matches, got \(count)")
-
-// 2. Exercise cancellation: cancel() before iteration prevents startup.
-let cancelled = Ripgrep.search("needle", in: root)
-cancelled.cancel()
-let first = try await cancelled.makeAsyncIterator().next()
-precondition(first == nil, "cancelled search must end immediately")
-
-print("release consumer verification passed: consumed \(count) matches, cancellation clean")
-EOF
+cp "$FIXTURE" "$CONSUMER/Sources/Consumer/main.swift"
 
 cd "$CONSUMER"
 

@@ -29,4 +29,10 @@ swift build
 echo "==> swift test"
 swift test
 
+# Pre-release gate: compile and run the exact fixture that
+# verify-release-consumer.sh ships to release consumers, against the local
+# build, so fixture bugs surface before a tag is created.
+echo "==> validate release-consumer fixture"
+"$SCRIPT_DIR/check-release-consumer-fixture.sh"
+
 echo "All checks passed."

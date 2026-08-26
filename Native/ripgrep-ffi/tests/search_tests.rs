@@ -5,7 +5,7 @@
 
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ripgrep_ffi::search::{collect_matches, search, SearchOptions, SearchOutcome, SearchProgress};
 use tempfile::TempDir;
@@ -28,6 +28,22 @@ fn fixture(files: &[(&str, &str)]) -> TempDir {
 
 fn default_options() -> SearchOptions {
     SearchOptions::default()
+}
+
+/// Blocks until `observed` becomes non-zero. Bounded so a search whose
+/// progress callback never fires (or never starts) fails with a clear
+/// error instead of hanging the test forever; the panic surfaces through
+/// the canceller thread's `join()`.
+fn await_first_report(observed: &AtomicU64, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while observed.load(Ordering::Acquire) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {what}: the search never reported progress, \
+             so the progress handshake cannot be synchronized"
+        );
+        std::thread::sleep(Duration::from_micros(100));
+    }
 }
 
 #[test]
@@ -353,9 +369,7 @@ fn external_cancel_flag_stops_running_search_between_and_within_files() {
         let cancel = cancel.clone();
         let bytes_seen = bytes_seen.clone();
         std::thread::spawn(move || {
-            while bytes_seen.load(Ordering::Acquire) == 0 {
-                std::thread::sleep(Duration::from_micros(100));
-            }
+            await_first_report(&bytes_seen, "first progress report");
             cancel.store(true, Ordering::Release);
         })
     };
@@ -410,9 +424,7 @@ fn cancellation_interrupts_single_large_file_without_matches() {
         let progress_seen = progress_seen.clone();
         std::thread::spawn(move || {
             // Wait until reading has demonstrably started, then cancel.
-            while progress_seen.load(Ordering::Acquire) == 0 {
-                std::thread::sleep(Duration::from_micros(100));
-            }
+            await_first_report(&progress_seen, "first progress report");
             cancel.store(true, Ordering::Release);
         })
     };

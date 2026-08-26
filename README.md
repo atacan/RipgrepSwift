@@ -238,6 +238,11 @@ against it, runs a real search consuming results, exercises cancellation,
 and fails on any problem. It also runs automatically for published
 releases via the `Release verification` GitHub Actions workflow.
 
+The fixture itself lives in `Scripts/release-consumer/main.swift` and is
+validated before any tag is created: `./Scripts/verify.sh` (part of the
+release checklist's first step) compiles and runs it against the freshly
+built local XCFramework via `Scripts/check-release-consumer-fixture.sh`.
+
 ## Architecture
 
 ```
