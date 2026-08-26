@@ -1,0 +1,20 @@
+[package]
+name = "ripgrep-ffi"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "ripgrep_ffi"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+grep = "0.4"
+ignore = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
