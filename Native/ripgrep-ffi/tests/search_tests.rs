@@ -4,8 +4,10 @@
 //! that most behavior should be testable from plain Rust.
 
 use std::ops::ControlFlow;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
-use ripgrep_ffi::search::{collect_matches, search, SearchOptions, SearchOutcome};
+use ripgrep_ffi::search::{collect_matches, search, SearchOptions, SearchOutcome, SearchProgress};
 use tempfile::TempDir;
 
 fn fixture(files: &[(&str, &str)]) -> TempDir {
@@ -255,14 +257,21 @@ fn cancellation_stops_search_after_n_matches() {
     let root = fixture(&[("big.txt", contents.as_str())]);
 
     let mut seen = 0usize;
-    let outcome = search(root.path(), "needle", default_options(), |_| {
-        seen += 1;
-        if seen >= 10 {
-            ControlFlow::Break(())
-        } else {
-            ControlFlow::Continue(())
-        }
-    })
+    let outcome = search(
+        root.path(),
+        "needle",
+        default_options(),
+        &AtomicBool::new(false),
+        |_| {
+            seen += 1;
+            if seen >= 10 {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        },
+        |_| {},
+    )
     .expect("search runs");
 
     assert_eq!(outcome, SearchOutcome::Cancelled);
@@ -274,14 +283,172 @@ fn completion_reported_when_not_cancelled() {
     let root = fixture(&[("small.txt", "needle once\n")]);
 
     let mut calls = 0usize;
-    let outcome = search(root.path(), "needle", default_options(), |_| {
-        calls += 1;
-        ControlFlow::Continue(())
-    })
+    let outcome = search(
+        root.path(),
+        "needle",
+        default_options(),
+        &AtomicBool::new(false),
+        |_| {
+            calls += 1;
+            ControlFlow::Continue(())
+        },
+        |_| {},
+    )
     .expect("search runs");
 
     assert_eq!(outcome, SearchOutcome::Completed);
     assert_eq!(calls, 1);
+}
+
+#[test]
+fn preset_cancel_flag_stops_search_before_any_match() {
+    let root = fixture(&[("a.txt", "needle a\n"), ("b.txt", "needle b\n")]);
+
+    let mut calls = 0usize;
+    let outcome = search(
+        root.path(),
+        "needle",
+        default_options(),
+        &AtomicBool::new(true),
+        |_| {
+            calls += 1;
+            ControlFlow::Continue(())
+        },
+        |_| {},
+    )
+    .expect("search runs");
+
+    // The flag short-circuits traversal; nothing is reported and the
+    // outcome is cancellation rather than an error or completion.
+    assert_eq!(outcome, SearchOutcome::Cancelled);
+    assert_eq!(calls, 0);
+}
+
+#[test]
+fn external_cancel_flag_stops_running_search_between_and_within_files() {
+    let root = fixture(&[
+        ("a.txt", "needle a\n"),
+        ("b.txt", "needle b\n"),
+        ("c.txt", "no match here\n"),
+        ("d.txt", "needle d\n"),
+    ]);
+
+    let cancel = std::sync::Arc::new(AtomicBool::new(false));
+    let canceller = {
+        let cancel = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1));
+            cancel.store(true, Ordering::Release);
+        })
+    };
+
+    let mut seen = 0usize;
+    let outcome = search(
+        root.path(),
+        "needle",
+        default_options(),
+        &cancel,
+        |_| {
+            seen += 1;
+            ControlFlow::Continue(())
+        },
+        |_| {},
+    )
+    .expect("search runs");
+
+    canceller.join().expect("canceller");
+    assert_eq!(outcome, SearchOutcome::Cancelled);
+    assert!(seen < 4, "search must not have completed: {seen}");
+}
+
+#[test]
+fn cancellation_interrupts_single_large_file_without_matches() {
+    // One multi-megabyte file with no matches at all. The searcher never
+    // invokes the match callback, so only the per-chunk check inside the
+    // reader can stop it before the whole file is read.
+    let line = "alpha beta gamma delta epsilon zeta eta theta\n";
+    let contents = line.repeat(400_000); // ~18 MB
+    let root = fixture(&[("huge.txt", contents.as_str())]);
+    let total_bytes = std::fs::metadata(root.path().join("huge.txt"))
+        .unwrap()
+        .len();
+
+    let cancel = std::sync::Arc::new(AtomicBool::new(false));
+    let progress_seen = std::sync::Arc::new(AtomicU64::new(0));
+
+    let canceller = {
+        let cancel = cancel.clone();
+        let progress_seen = progress_seen.clone();
+        std::thread::spawn(move || {
+            // Wait until reading has demonstrably started, then cancel.
+            while progress_seen.load(Ordering::Acquire) == 0 {
+                std::thread::sleep(Duration::from_micros(100));
+            }
+            cancel.store(true, Ordering::Release);
+        })
+    };
+
+    let mut matches = 0usize;
+    let outcome = search(
+        root.path(),
+        "zzz-never-present-zzz",
+        default_options(),
+        &cancel,
+        |_m| {
+            matches += 1;
+            ControlFlow::Continue(())
+        },
+        |progress: SearchProgress| {
+            progress_seen.store(progress.bytes_searched, Ordering::Release);
+        },
+    )
+    .expect("search runs");
+
+    canceller.join().expect("canceller");
+
+    assert_eq!(matches, 0);
+    assert_eq!(outcome, SearchOutcome::Cancelled);
+    // The decisive assertion: the file was NOT read to the end. Only the
+    // chunk-level in-file cancellation can guarantee this for a matchless
+    // file.
+    let final_bytes = progress_seen.load(Ordering::Acquire);
+    assert!(
+        final_bytes < total_bytes,
+        "cancelled after {final_bytes} of {total_bytes} bytes"
+    );
+}
+
+#[test]
+fn progress_callback_counts_files_and_bytes_exactly() {
+    let root = fixture(&[
+        ("a.txt", "one two three\n"),
+        ("b.txt", "four five six seven\n"),
+    ]);
+
+    let cancel = AtomicBool::new(false);
+    let mut calls = Vec::new();
+    let outcome = search(
+        root.path(),
+        "two",
+        default_options(),
+        &cancel,
+        |_m| ControlFlow::Continue(()),
+        |progress: SearchProgress| calls.push(progress),
+    )
+    .expect("search runs");
+
+    assert_eq!(outcome, SearchOutcome::Completed);
+    assert!(!calls.is_empty());
+    let last = calls.last().unwrap();
+    assert_eq!(last.files_visited, 2);
+    let expected_bytes: u64 = std::fs::read(root.path().join("a.txt")).unwrap().len() as u64
+        + std::fs::read(root.path().join("b.txt")).unwrap().len() as u64;
+    assert_eq!(last.bytes_searched, expected_bytes);
+    // Snapshots are cumulative and monotonic.
+    for pair in calls.windows(2) {
+        assert!(pair[0].bytes_searched <= pair[1].bytes_searched);
+        assert!(pair[0].files_visited <= pair[1].files_visited);
+    }
 }
 
 #[cfg(unix)]

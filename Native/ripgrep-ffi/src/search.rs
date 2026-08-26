@@ -3,11 +3,25 @@
 //! This module contains no FFI. It walks a directory tree with the `ignore`
 //! crate, searches each file with the `grep` crates, and reports every
 //! individual regular-expression match through a caller-supplied closure.
-//! Cancellation flows back through `ControlFlow::Break`.
+//!
+//! Cancellation is driven by an externally owned [`AtomicBool`] that is
+//! checked independently of match callbacks:
+//!
+//! * between files, before each directory entry is processed;
+//! * inside a file, before every read chunk (via a cancellation-aware
+//!   reader), so even one huge file with no matches stops reading shortly
+//!   after cancellation is requested;
+//! * when a match callback returns [`ControlFlow::Break`].
+//!
+//! Progress (files visited and bytes read so far) is reported through an
+//! optional callback so embedders can instrument searches.
 
 use std::cell::Cell;
+use std::fs::File;
+use std::io::Read;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use grep_matcher::{Match, Matcher};
 use grep_regex::RegexMatcherBuilder;
@@ -52,20 +66,40 @@ pub struct SearchMatch<'a> {
     pub match_end: usize,
 }
 
+/// Traversal progress snapshot delivered to the progress callback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchProgress {
+    /// Number of regular files whose search has started.
+    pub files_visited: u64,
+    /// Total number of bytes read across all searched files so far.
+    pub bytes_searched: u64,
+}
+
 /// Result of a full search run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchOutcome {
     /// Every file was searched to completion.
     Completed,
-    /// The consumer cancelled the search via its callback.
+    /// The search was cancelled, either by the consumer's callback or by
+    /// the external cancellation flag.
     Cancelled,
 }
 
 /// Searches `root` for `pattern`, invoking `on_match` for every individual
 /// regex match (a line containing three matches produces three callbacks).
 ///
-/// Returning `ControlFlow::Break` from `on_match` cancels the search as soon
-/// as practical; the function then returns [`SearchOutcome::Cancelled`].
+/// `cancel` is observed continuously and independently of `on_match`:
+///
+/// * before each directory entry during traversal;
+/// * before each read chunk while scanning a file, so cancellation takes
+///   effect inside long individual-file searches even when no matches are
+///   being produced. The granularity is one read chunk (kilobytes), not a
+///   single line or regex evaluation; the current chunk completes first.
+///
+/// Returning [`ControlFlow::Break`] from `on_match` also cancels the search.
+/// In every cancelled case the function returns
+/// [`SearchOutcome::Cancelled`]; `on_progress`, when provided, receives a
+/// cumulative snapshot after each read chunk.
 ///
 /// Traversal notes:
 ///
@@ -79,20 +113,27 @@ pub enum SearchOutcome {
 /// * Files are treated as binary once a NUL byte is observed (ripgrep's
 ///   default "quit" strategy); searching of such a file stops silently at
 ///   that point.
-pub fn search<F>(
+pub fn search<F, P>(
     root: &Path,
     pattern: &str,
     options: SearchOptions,
+    cancel: &AtomicBool,
     mut on_match: F,
+    mut on_progress: P,
 ) -> Result<SearchOutcome, crate::error::SearchError>
 where
     F: FnMut(SearchMatch<'_>) -> ControlFlow<()>,
+    P: FnMut(SearchProgress),
 {
     if !root.exists() {
         return Err(crate::error::SearchError::Io(format!(
             "search root {} does not exist",
             root.display()
         )));
+    }
+
+    if cancel.load(Ordering::Acquire) {
+        return Ok(SearchOutcome::Cancelled);
     }
 
     let matcher = RegexMatcherBuilder::new()
@@ -115,10 +156,12 @@ where
         walker_builder.parents(false);
     }
 
-    let cancelled = Cell::new(false);
+    let cancelled_by_callback = Cell::new(false);
+    let files_visited = Cell::new(0u64);
+    let bytes_searched = Cell::new(0u64);
 
     for entry in walker_builder.build() {
-        if cancelled.get() {
+        if cancelled_by_callback.get() || cancel.load(Ordering::Acquire) {
             break;
         }
         let entry = match entry {
@@ -137,19 +180,37 @@ where
             continue;
         }
 
+        files_visited.set(files_visited.get() + 1);
+
         let sink = CallbackSink {
             matcher: &matcher,
             path,
             callback: &mut on_match,
-            cancelled: &cancelled,
+            cancelled: &cancelled_by_callback,
         };
 
-        // Errors while reading an individual file must not abort the whole
-        // search; skip the file and keep going.
-        let _ = searcher.search_path(&matcher, path, sink);
+        // Opening the file ourselves lets the reader observe cancellation
+        // before every chunk, which `search_path` alone cannot offer. A
+        // failure to open is skipped like any other per-entry error.
+        if let Ok(file) = File::open(path) {
+            let mut reader = CancellationReader {
+                inner: file,
+                cancel,
+                bytes_searched: &bytes_searched,
+                files_visited: files_visited.get(),
+                progress: &mut on_progress,
+            };
+            match searcher.search_reader(&matcher, &mut reader, sink) {
+                Err(error) if is_cancellation_error(&error) => break,
+                // Any other per-file error must not abort the whole
+                // search; skip the file and keep going.
+                _ => {}
+            }
+        }
     }
 
-    Ok(if cancelled.get() {
+    let cancelled = cancelled_by_callback.get() || cancel.load(Ordering::Acquire);
+    Ok(if cancelled {
         SearchOutcome::Cancelled
     } else {
         SearchOutcome::Completed
@@ -206,6 +267,59 @@ where
     }
 }
 
+/// Wraps a file reader so that cancellation is observed before every read
+/// chunk, not just between files or at match callbacks. Byte counts are
+/// accumulated and reported through the progress callback.
+struct CancellationReader<'a, R, P> {
+    inner: R,
+    cancel: &'a AtomicBool,
+    bytes_searched: &'a Cell<u64>,
+    files_visited: u64,
+    progress: &'a mut P,
+}
+
+impl<R, P> Read for CancellationReader<'_, R, P>
+where
+    R: Read,
+    P: FnMut(SearchProgress),
+{
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.cancel.load(Ordering::Acquire) {
+            return Err(std::io::Error::other(SearchCancelled));
+        }
+        let read = self.inner.read(buf)?;
+        if read > 0 {
+            self.bytes_searched
+                .set(self.bytes_searched.get() + read as u64);
+            (self.progress)(SearchProgress {
+                files_visited: self.files_visited,
+                bytes_searched: self.bytes_searched.get(),
+            });
+        }
+        Ok(read)
+    }
+}
+
+/// Marker error used to unwind out of the searcher once cancellation has
+/// been requested mid-file. It never escapes this module: it is recognized
+/// and converted into [`SearchOutcome::Cancelled`] by the traversal loop.
+#[derive(Debug)]
+struct SearchCancelled;
+
+impl std::fmt::Display for SearchCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "search cancelled")
+    }
+}
+
+impl std::error::Error for SearchCancelled {}
+
+fn is_cancellation_error(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<SearchCancelled>())
+}
+
 /// Removes a single trailing `\n` or `\r\n` from a line delivered by the
 /// searcher. All reported offsets index into the returned slice.
 fn strip_line_terminator(bytes: &[u8]) -> &[u8] {
@@ -231,16 +345,23 @@ pub fn collect_matches(
     options: SearchOptions,
 ) -> Result<Vec<CollectedMatch>, crate::error::SearchError> {
     let mut collected = Vec::new();
-    let outcome = search(root, pattern, options, |m| {
-        collected.push((
-            m.path.to_path_buf(),
-            m.line_number,
-            String::from_utf8_lossy(m.line).into_owned(),
-            m.match_start,
-            m.match_end,
-        ));
-        ControlFlow::Continue(())
-    })?;
+    let outcome = search(
+        root,
+        pattern,
+        options,
+        &AtomicBool::new(false),
+        |m| {
+            collected.push((
+                m.path.to_path_buf(),
+                m.line_number,
+                String::from_utf8_lossy(m.line).into_owned(),
+                m.match_start,
+                m.match_end,
+            ));
+            ControlFlow::Continue(())
+        },
+        |_| {},
+    )?;
     debug_assert_eq!(outcome, SearchOutcome::Completed);
     Ok(collected)
 }

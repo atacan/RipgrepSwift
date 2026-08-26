@@ -36,8 +36,23 @@ Rust toolchain. To build against a locally built XCFramework instead, set
 
 ### `Ripgrep.search(_:in:options:)`
 
-Returns a `RipgrepSearchResults: AsyncSequence`. The native search runs on a
-background task; matches are delivered serially as they are discovered.
+Returns a `RipgrepSearchResults: AsyncSequence`. **Startup is lazy**: calling
+`Ripgrep.search(...)` only constructs the search description. Filesystem
+traversal begins exactly once, when the single consuming iterator is created
+(explicitly or via `for try await`). Consequences:
+
+- Creating the sequence and dropping it without iterating starts no native
+  work at all — nothing to leak, nothing to clean up.
+- Calling `cancel()` before iteration permanently prevents startup; later
+  iteration simply ends with `nil`.
+- Requesting a second iterator returns an already-finished iterator; it
+  neither restarts nor corrupts the first search.
+
+The native search runs on its **own dedicated background thread** (a
+Foundation `Thread` at `.utility` quality of service) — never on the Swift
+cooperative executor pool. Only that producer thread ever blocks; consumer
+code suspends through continuations, so awaiting results occupies no
+cooperative worker.
 
 Delivery is **strictly backpressured**: the native filesystem search is
 parked between consumer requests and cannot advance until your code asks for
@@ -49,8 +64,7 @@ A line containing several regex matches produces one `RipgrepMatch` per
 match, all sharing the same `lineNumber` and `line`.
 
 The sequence supports exactly **one** consuming iterator (single pass), like
-most streaming APIs. Calling its iterator again yields `nil`; create a new
-search to run again.
+most streaming APIs.
 
 ### `RipgrepMatch`
 
@@ -103,13 +117,24 @@ C status codes are never exposed.
 - **Binary files**: once a NUL byte is observed in a file (ripgrep's default
   "quit" detection), searching that file stops silently.
 - **Cancellation**: stopping iteration (`break`), cancelling the consuming
-  task, dropping the sequence, or calling `cancel()` explicitly stops the
-  native search as soon as practical. Because delivery is pull-based, an
-  abandoned search is parked at its next match and unwinds without scanning
-  the rest of the tree. Cancellation is never reported as an error.
+  task, dropping the live iterator, or calling `cancel()` explicitly stops
+  the native search. Cancellation is **native and independent of match
+  callbacks**: an explicit cancellation token is observed by the Rust core
+
+  - between files during traversal,
+  - before every read chunk *inside* a file — so even a single huge file
+    containing no matches at all stops reading well before its end, and
+  - immediately when the producer is parked on the backpressure gate.
+
+  Cancellation granularity is one read chunk (kilobytes) within a file; the
+  chunk in flight when cancellation lands finishes first. It is not
+  reported as an error: iteration ends with `nil`, and `rg_search` returns
+  `RG_STATUS_CANCELLED`. Dropping the sequence without ever iterating never
+  starts a search in the first place (lazy startup).
 - **Concurrency**: one search delivers results serially to a single
-  consumer. Independent searches may run concurrently; there is no shared
-  mutable state between searches.
+  consumer from its own dedicated producer thread. Independent searches run
+  concurrently on their own threads; there is no shared mutable state
+  between searches.
 - **Paths**: v1 supports paths representable as UTF-8 via `URL`. Paths Rust
   discovers that are not valid UTF-8 are skipped rather than corrupted.
 - **Unreadable files**: individual traversal/read errors are skipped so one
@@ -178,13 +203,21 @@ Rust installed:
 
 ```bash
 ./Scripts/build-xcframework.sh
-./Scripts/package-release.sh 0.1.0 atacan/RipgrepSwift
-gh release create 0.1.0 Release/CRipgrep.xcframework.zip --title "0.1.0"
+./Scripts/package-release.sh 0.1.1 atacan/RipgrepSwift
+gh release create 0.1.1 Release/CRipgrep.xcframework.zip --title "0.1.1"
 ```
 
-`package-release.sh` prints the SwiftPM checksum; it must match the
-`checksum:` in `Package.swift`. Release asset URLs are immutable — do not
-replace the zip behind an existing tag without updating `Package.swift`.
+`package-release.sh` prints the SwiftPM checksum. **Release checklist:**
+
+1. Build and package the zip (commands above).
+2. Create the GitHub release with the zip attached.
+3. Update the `url:`/`checksum:` in `Package.swift` to the new tag and
+   printed checksum — release asset URLs are immutable, so this must only
+   happen after the release exists.
+4. Bump the installation snippet in this README to the new version.
+
+Until those steps run, `Package.swift` keeps pointing at the published
+`0.1.0` asset; development builds use `RIPGREP_XCFRAMEWORK_PATH`.
 
 ## Architecture
 
@@ -192,13 +225,15 @@ replace the zip behind an existing tag without updating `Package.swift`.
 Swift application
         │
         ▼
-Public Swift API (Ripgrep, RipgrepMatch, RipgrepOptions)
+Public Swift API (Ripgrep, RipgrepSearchResults, RipgrepMatch, RipgrepOptions)
+  lazy start · strict backpressure · dedicated producer Thread · cancellation
         │
         ▼
 CRipgrep module (ripgrep_ffi.h, small stable C ABI)
         │
         ▼
-Rust FFI crate (panic containment, ownership rules, callback bridge)
+Rust FFI crate (panic containment, ownership rules,
+                rg_cancel_token_t native cancellation)
         │
    ┌────┴─────┐
    ▼          ▼

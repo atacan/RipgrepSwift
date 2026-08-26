@@ -46,6 +46,17 @@ typedef bool (*rg_match_callback_t)(
     const rg_match_t *match
 );
 
+/*
+ * Optional progress reporting. Invoked after each read chunk with the
+ * cumulative number of regular files whose search has started and the
+ * cumulative number of bytes read so far. May be NULL.
+ */
+typedef void (*rg_progress_callback_t)(
+    void *context,
+    uint64_t files_visited,
+    uint64_t bytes_searched
+);
+
 typedef enum rg_status {
     RG_STATUS_OK = 0,
     RG_STATUS_CANCELLED = 1,
@@ -56,11 +67,50 @@ typedef enum rg_status {
 } rg_status_t;
 
 /*
+ * Opaque cancellation token, owned by the caller.
+ *
+ * Create with rg_cancel_token_create and release with
+ * rg_cancel_token_free exactly once. A token must outlive every rg_search
+ * call that received it; freeing a token while a search is still using it
+ * is a caller error. The token may be cancelled from any thread while a
+ * search is in flight; cancellation is atomic and idempotent.
+ */
+typedef struct rg_cancel_token rg_cancel_token_t;
+
+/* Creates a cancellation token. Returns NULL only on allocation failure. */
+rg_cancel_token_t *rg_cancel_token_create(void);
+
+/*
+ * Requests cancellation: every rg_search call using this token stops as
+ * soon as practical — between files, before each read chunk inside a file,
+ * or immediately when parked on a match callback — and finishes with
+ * RG_STATUS_CANCELLED. Idempotent; safe from any thread. Passing NULL does
+ * nothing.
+ */
+void rg_cancel_token_cancel(rg_cancel_token_t *token);
+
+/*
+ * Releases a token previously produced by rg_cancel_token_create. Passing
+ * NULL does nothing. Must not be called while any rg_search call is still
+ * using the token.
+ */
+void rg_cancel_token_free(rg_cancel_token_t *token);
+
+/*
  * Synchronously search `root` for `pattern`, delivering each match through
  * `callback(context, match)`. All input byte ranges are borrowed for the
- * duration of the call only. On failure, if `error_message` is non-null it
- * receives a heap-allocated, NUL-terminated UTF-8 string that the caller
- * must release with rg_free_string. Never panics across the FFI boundary.
+ * duration of the call only.
+ *
+ * `cancel_token` may be NULL (the search then cannot be cancelled except
+ * by the callback returning false). Cancellation requested through the
+ * token surfaces as RG_STATUS_CANCELLED, never as an error.
+ *
+ * `progress` may be NULL; when non-null it receives cumulative traversal
+ * progress as described above.
+ *
+ * On failure, if `error_message` is non-null it receives a heap-allocated,
+ * NUL-terminated UTF-8 string that the caller must release with
+ * rg_free_string. Never panics across the FFI boundary.
  */
 rg_status_t rg_search(
     const uint8_t *root,
@@ -71,8 +121,13 @@ rg_status_t rg_search(
 
     const rg_search_options_t *options,
 
+    const rg_cancel_token_t *cancel_token,
+
     rg_match_callback_t callback,
     void *context,
+
+    rg_progress_callback_t progress,
+    void *progress_context,
 
     char **error_message
 );

@@ -2,8 +2,8 @@
 //!
 //! Rules enforced by this module:
 //!
-//! * No Rust type other than the `#[repr(C)]` structs below ever crosses the
-//!   boundary.
+//! * No Rust type other than the `#[repr(C)]` structs and the opaque
+//!   cancellation token below ever crosses the boundary.
 //! * All input byte ranges are borrowed for the duration of the call only.
 //! * Match data delivered to the callback borrows Rust-owned buffers that
 //!   may be reused after the callback returns; receivers must copy.
@@ -11,12 +11,16 @@
 //!   `RG_STATUS_INTERNAL_ERROR`; nothing unwinds into the caller.
 //! * Error strings are allocated with `CString::into_raw` and can only be
 //!   released via `rg_free_string`.
+//! * Cancellation tokens are explicitly owned by the caller: created with
+//!   `rg_cancel_token_create`, released with `rg_cancel_token_free`, and
+//!   they must outlive every `rg_search` call that received them.
 
 use std::ffi::{c_char, CString};
 use std::ops::ControlFlow;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::search::{self, SearchMatch, SearchOptions, SearchOutcome};
 
@@ -47,6 +51,12 @@ pub struct rg_match {
 #[allow(non_camel_case_types)]
 pub type rg_match_callback_t =
     Option<unsafe extern "C" fn(context: *mut std::ffi::c_void, m: *const rg_match) -> bool>;
+
+/// Mirrors `rg_progress_callback_t` in ripgrep_ffi.h.
+#[allow(non_camel_case_types)]
+pub type rg_progress_callback_t = Option<
+    unsafe extern "C" fn(context: *mut std::ffi::c_void, files_visited: u64, bytes_searched: u64),
+>;
 
 /// Mirrors `rg_status_t` in ripgrep_ffi.h.
 #[repr(u32)]
@@ -79,13 +89,75 @@ impl From<SearchOutcome> for rg_status {
     }
 }
 
+/// The type behind `rg_cancel_token_t`. Entirely opaque to callers; no part
+/// of its layout is part of the ABI contract.
+#[allow(non_camel_case_types)]
+pub struct rg_cancel_token {
+    cancelled: AtomicBool,
+}
+
+static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
+
+/// Creates a cancellation token. Returns NULL only on allocation failure.
+///
+/// Ownership: the caller owns the returned token and must release it with
+/// [`rg_cancel_token_free`] exactly once. A token must outlive every call
+/// that passed it to `rg_search`; freeing it while such a call is running
+/// is a caller error.
+///
+/// Cancellation is idempotent and safe from any thread: see
+/// [`rg_cancel_token_cancel`].
+///
+/// # Thread safety
+///
+/// The token may be cancelled concurrently with an in-flight search; the
+/// flag is atomic. All other operations (create/free) are not thread-safe
+/// with respect to each other for the same token.
+#[no_mangle]
+pub extern "C" fn rg_cancel_token_create() -> *mut rg_cancel_token {
+    Box::into_raw(Box::new(rg_cancel_token {
+        cancelled: AtomicBool::new(false),
+    }))
+}
+
+/// Requests cancellation of every `rg_search` call currently using this
+/// token. Idempotent; calling it more than once has no additional effect.
+/// Safe to call from any thread, including while a search is running on
+/// another thread. Passing NULL is allowed and does nothing.
+///
+/// # Safety
+/// `token` must be null or a live token produced by
+/// [`rg_cancel_token_create`] that has not been freed yet.
+#[no_mangle]
+pub unsafe extern "C" fn rg_cancel_token_cancel(token: *mut rg_cancel_token) {
+    if !token.is_null() {
+        unsafe { (*token).cancelled.store(true, Ordering::Release) };
+    }
+}
+
+/// Releases a token previously produced by [`rg_cancel_token_create`].
+/// Passing NULL is allowed and does nothing.
+///
+/// # Safety
+/// `token` must be null or a token that has not been freed yet, and no
+/// `rg_search` call may still be using it.
+#[no_mangle]
+pub unsafe extern "C" fn rg_cancel_token_free(token: *mut rg_cancel_token) {
+    if !token.is_null() {
+        drop(unsafe { Box::from_raw(token) });
+    }
+}
+
 /// # Safety
 ///
 /// * `root`/`pattern` must point to at least their stated number of readable
 ///   bytes for the duration of the call (a null pointer with zero length is
 ///   accepted for an empty pattern).
 /// * `options` must point to a valid `rg_search_options`.
-/// * `context` is passed through to `callback` untouched.
+/// * `cancel_token` must be null or a live token that stays valid until this
+///   call returns.
+/// * `context` and `progress_context` are passed through to their callbacks
+///   untouched.
 ///
 /// See the header for ownership rules.
 #[no_mangle]
@@ -95,8 +167,11 @@ pub unsafe extern "C" fn rg_search(
     pattern: *const u8,
     pattern_len: usize,
     options: *const rg_search_options,
+    cancel_token: *const rg_cancel_token,
     callback: rg_match_callback_t,
     context: *mut std::ffi::c_void,
+    progress: rg_progress_callback_t,
+    progress_context: *mut std::ffi::c_void,
     error_message: *mut *mut c_char,
 ) -> rg_status {
     if let Some(slot) = unsafe { error_message.as_mut() } {
@@ -110,8 +185,11 @@ pub unsafe extern "C" fn rg_search(
             pattern,
             pattern_len,
             options,
+            cancel_token,
             callback,
             context,
+            progress,
+            progress_context,
             error_message,
         )
     }));
@@ -138,8 +216,11 @@ unsafe fn rg_search_impl(
     pattern: *const u8,
     pattern_len: usize,
     options: *const rg_search_options,
+    cancel_token: *const rg_cancel_token,
     callback: rg_match_callback_t,
     context: *mut std::ffi::c_void,
+    progress: rg_progress_callback_t,
+    progress_context: *mut std::ffi::c_void,
     error_message: *mut *mut c_char,
 ) -> rg_status {
     if root.is_null() || root_len == 0 || options.is_null() || callback.is_none() {
@@ -173,15 +254,36 @@ unsafe fn rg_search_impl(
     // Checked non-null above.
     let callback = callback.unwrap_unchecked();
 
-    let result = search::search(Path::new(&root_str), &pattern_str, search_options, |m| {
-        let c_match = build_c_match(&m);
-        let continue_search = unsafe { callback(context, &c_match) };
-        if continue_search {
-            ControlFlow::Continue(())
-        } else {
-            ControlFlow::Break(())
-        }
-    });
+    // A null token means "cannot be cancelled": substitute a flag nobody
+    // ever sets so the safe core keeps a single signature.
+    let cancel: &AtomicBool = if cancel_token.is_null() {
+        &NEVER_CANCELLED
+    } else {
+        // Borrow lives exactly as long as this call; the caller contracts
+        // to keep the token alive for the duration.
+        unsafe { &(*cancel_token).cancelled }
+    };
+
+    let result = search::search(
+        Path::new(&root_str),
+        &pattern_str,
+        search_options,
+        cancel,
+        |m| {
+            let c_match = build_c_match(&m);
+            let continue_search = unsafe { callback(context, &c_match) };
+            if continue_search {
+                ControlFlow::Continue(())
+            } else {
+                ControlFlow::Break(())
+            }
+        },
+        |p| {
+            if let Some(progress_fn) = progress {
+                unsafe { progress_fn(progress_context, p.files_visited, p.bytes_searched) };
+            }
+        },
+    );
 
     match result {
         Ok(outcome) => outcome.into(),

@@ -26,9 +26,48 @@ enum TestFixture {
         return root
     }
 
+    /// Creates a temporary directory containing one very large text file
+    /// whose contents never match typical patterns (no occurrence of
+    /// "needle" or similar). Written in bulk blocks so generation stays
+    /// fast even for hundreds of megabytes.
+    static func makeLargeNoMatchFile(name: String = "filler.txt", sizeBytes: Int) throws -> URL {
+        let root = try make([:])
+        let chunkLine = "alpha beta gamma delta epsilon zeta eta theta iota kappa\n"
+        // ~5 MB super-chunk, written repeatedly.
+        let superChunk = Data(String(repeating: chunkLine, count: 170_000).utf8)
+        precondition(superChunk.count > 1_000_000)
+        let fileURL = root.appendingPathComponent(name)
+        FileManager.default.createFile(atPath: fileURL.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: fileURL)
+        defer { try? handle.close() }
+        var written = 0
+        while written < sizeBytes {
+            try handle.write(contentsOf: superChunk)
+            written += superChunk.count
+        }
+        return root
+    }
+
     static func remove(_ url: URL) {
         try? FileManager.default.removeItem(at: url)
     }
+}
+
+/// Polls `predicate` until it holds or the timeout elapses. Used to wait
+/// for *bounded* native-side events (producer unwinding); assertions about
+/// absence of activity are always structural, never sleep-based.
+@discardableResult
+func waitUntil(
+    timeout: Duration = .seconds(30),
+    interval: Duration = .milliseconds(5),
+    _ predicate: () -> Bool
+) async throws -> Bool {
+    let deadline = ContinuousClock.now.advanced(by: timeout)
+    while ContinuousClock.now < deadline {
+        if predicate() { return true }
+        try await Task.sleep(for: interval)
+    }
+    return predicate()
 }
 
 /// Collects an entire search into an array. Tests that need streaming or
