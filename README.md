@@ -22,7 +22,7 @@ for try await match in Ripgrep.search("TODO|FIXME", in: root) {
 dependencies: [
     .package(
         url: "https://github.com/atacan/RipgrepSwift.git",
-        from: "0.1.1"
+        from: "0.1.2"
     )
 ]
 ```
@@ -203,8 +203,8 @@ Rust installed:
 
 ```bash
 ./Scripts/build-xcframework.sh
-./Scripts/package-release.sh 0.1.1 atacan/RipgrepSwift
-gh release create 0.1.1 Release/CRipgrep.xcframework.zip --title "0.1.1"
+./Scripts/package-release.sh 0.1.2 atacan/RipgrepSwift
+gh release create 0.1.2 Release/CRipgrep.xcframework.zip --title "0.1.2"
 ```
 
 `package-release.sh` prints the SwiftPM checksum. **Release checklist** (in
@@ -227,7 +227,7 @@ Development builds test against a freshly built local XCFramework (see
 above). To verify what a real SwiftPM consumer downloads instead:
 
 ```bash
-./Scripts/verify-release-consumer.sh 0.1.1
+./Scripts/verify-release-consumer.sh 0.1.2
 ```
 
 This creates a fresh temporary executable package depending on this repo at

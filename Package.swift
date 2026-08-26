@@ -12,8 +12,8 @@ if let localXCFrameworkPath = ProcessInfo.processInfo.environment["RIPGREP_XCFRA
 } else {
     cRipgrepTarget = .binaryTarget(
         name: "CRipgrep",
-        url: "https://github.com/atacan/RipgrepSwift/releases/download/0.1.1/CRipgrep.xcframework.zip",
-        checksum: "29b6ed37d978c3ffc0e2737033bae2570470bcf2e2e264676f09c2e2edabaa09"
+        url: "https://github.com/atacan/RipgrepSwift/releases/download/0.1.2/CRipgrep.xcframework.zip",
+        checksum: "9ea2aa092a0917f66f945765b1669be64d1dd1c497c9c4d5dad7a77527bc2722"
     )
 }
 

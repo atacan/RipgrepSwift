@@ -9,11 +9,11 @@
 #       -> compile + link against that downloaded binary
 #       -> run a real search and exercise cancellation
 #
-# Usage: Scripts/verify-release-consumer.sh [ref]  (default: 0.1.1)
+# Usage: Scripts/verify-release-consumer.sh [ref]  (default: 0.1.2)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REF="${1:-0.1.1}"
+REF="${1:-0.1.2}"
 REPO_URL="https://github.com/atacan/RipgrepSwift.git"
 FIXTURE="$SCRIPT_DIR/release-consumer/main.swift"
 
@@ -83,12 +83,12 @@ if ! grep -q "releases/download/$REF/CRipgrep.xcframework.zip" "$MANIFEST"; then
     exit 1
 fi
 
-# Hard proof the *downloaded* binary carries the v0.1.1 ABI: the old 0.1.0
-# binary does not contain rg_cancel_token_create. Apple's nm may refuse to
-# read archives produced by recent Rust LLVM versions, so check for the
-# symbol names in the archive directly; linking and running below is the
-# authoritative check.
-echo "==> Checking downloaded XCFramework for v0.1.1 ABI symbols"
+# Hard proof the *downloaded* binary carries the current ABI: older release
+# binaries (0.1.0 and earlier) do not contain rg_cancel_token_create.
+# Apple's nm may refuse to read archives produced by recent Rust LLVM
+# versions, so check for the symbol names in the archive directly; linking
+# and running below is the authoritative check.
+echo "==> Checking downloaded XCFramework for current ABI symbols"
 LIBRARY="$(find "$WORK_DIR/.build" -path '*CRipgrep.xcframework*' -name 'libripgrep_ffi.a' | head -1)"
 if [[ -z "$LIBRARY" ]]; then
     echo "FAIL: no libripgrep_ffi.a found among resolved artifacts." >&2
@@ -97,7 +97,7 @@ fi
 echo "    $LIBRARY"
 for symbol in _rg_cancel_token_create _rg_cancel_token_cancel _rg_cancel_token_free; do
     if ! grep -aq -- "$symbol" "$LIBRARY"; then
-        echo "FAIL: downloaded binary does not contain $symbol (pre-0.1.1 ABI)." >&2
+        echo "FAIL: downloaded binary does not contain $symbol (outdated ABI)." >&2
         exit 1
     fi
 done
