@@ -75,7 +75,8 @@ precondition(count == 100, "expected to consume 100 matches, got \(count)")
 // 2. Exercise cancellation: cancel() before iteration prevents startup.
 let cancelled = Ripgrep.search("needle", in: root)
 cancelled.cancel()
-precondition(try await cancelled.makeAsyncIterator().next() == nil)
+let first = try await cancelled.makeAsyncIterator().next()
+precondition(first == nil, "cancelled search must end immediately")
 
 print("release consumer verification passed: consumed \(count) matches, cancellation clean")
 EOF
