@@ -91,6 +91,8 @@ options.includeHidden = true       // default: false
 options.caseInsensitive = true     // default: false
 options.followSymbolicLinks = true // default: false
 options.respectGitIgnore = false   // default: true
+options.includeGlobs = ["**/*.swift", "**/*.rs"] // default: []
+options.excludeGlobs = ["**/.build/", "**/Generated/"] // default: []
 
 for try await match in Ripgrep.search("important", in: root, options: options) {
     // ...
@@ -99,11 +101,54 @@ for try await match in Ripgrep.search("important", in: root, options: options) {
 
 Defaults mirror the `rg` command line. See below for exact semantics.
 
+### Path globs (unreleased)
+
+This unreleased source checkout requires a freshly built local XCFramework and
+`RIPGREP_XCFRAMEWORK_PATH=Artifacts/CRipgrep.xcframework`. The published
+`0.1.2` binary does not contain this API. The release URL/checksum stay frozen
+until a new binary is built, packaged, and verified through the release flow.
+
+- An empty `includeGlobs` allows all otherwise eligible files. With patterns,
+  a file must match **at least one** include. Excludes are also ORed, and
+  **any matching exclude wins**, independent of array order.
+- Patterns use the `ignore` crate's case-sensitive gitignore-style glob
+  syntax: `*`, `?`, character classes, `**`, and brace alternatives. The
+  `caseInsensitive` option affects the search regex only.
+- Matching is relative to the search root, or its parent when searching a
+  single file. A leading `/` anchors a pattern to that root; it does not
+  denote a filesystem absolute path. Patterns without `/` match basenames
+  at any depth; `src/*.swift` matches directly inside root-level `src`, and
+  `**/*.swift` matches both root-level and nested Swift files.
+- A trailing `/` matches directories only. Excluding `Generated/` prunes
+  any directory with that name **before descent**. `Generated/**` excludes
+  its contents (including child directories), but does not match the
+  `Generated` directory itself. Include patterns select files; they never
+  prune unmatched parent directories. To include a directory's files use
+  `Generated/**`, rather than `Generated/`.
+- Globs narrow the existing traversal set: includes do not resurrect paths
+  skipped by `.gitignore`, `.ignore`, or hidden-file handling. Set
+  `respectGitIgnore: false` to disable ignore files, or `includeHidden: true`
+  to allow hidden paths. Explicit globs remain active in both cases.
+  Symlinks follow the existing `followSymbolicLinks` setting and are matched
+  by their traversal path, rather than their target's absolute path.
+- Empty/blank patterns, leading `!` (negation), leading `#` (comments), NUL,
+  and newlines are rejected. Escape a literal leading `!` or `#` with `\`.
+  Other backslash escaping and trailing-space handling follow gitignore
+  syntax. Malformed glob syntax throws `.invalidGlob(String)` during
+  iteration, before traversal or match delivery. Existing UTF-8 path,
+  cancellation, and backpressure contracts are unchanged.
+
+The implementation reuses `ignore::overrides::OverrideBuilder` matchers
+inside `WalkBuilder::filter_entry`. Direct walker overrides, like `rg -g`,
+can whitelist ignored/hidden paths and use last-match precedence; this
+structured API deliberately keeps the existing eligibility rules and makes
+excludes win unconditionally. See the [ignore walker rules](https://docs.rs/ignore/0.4.33/ignore/struct.WalkBuilder.html#ignore-rules).
+
 ### Errors
 
 All failures surface as `RipgrepError`: `.invalidPattern(String)`,
-`.invalidArgument(String)`, `.io(String)`, `.internalError(String)`. Numeric
-C status codes are never exposed.
+`.invalidGlob(String)`, `.invalidArgument(String)`, `.io(String)`,
+`.internalError(String)`. Numeric C status codes are never exposed.
 
 ## Behavior
 
@@ -144,7 +189,7 @@ C status codes are never exposed.
 ## Not implemented (yet)
 
 This first version intentionally implements a small slice of ripgrep:
-fixed-string matching, PCRE2, replacement, glob/type filters, context lines,
+fixed-string matching, PCRE2, replacement, file-type filters, context lines,
 multiline patterns, archive searching, parallel traversal, and JSON output
 are not available yet.
 
@@ -234,7 +279,8 @@ This creates a fresh temporary executable package depending on this repo at
 the given ref, requires that `RIPGREP_XCFRAMEWORK_PATH` is unset, lets
 SwiftPM download the GitHub Release XCFramework named by `Package.swift`,
 checks the downloaded binary exports the current ABI symbols, compiles
-against it, runs a real search consuming results, exercises cancellation,
+against it, runs a real search consuming results, exercises cancellation
+and (for glob-capable releases) path filtering and invalid-glob errors,
 and fails on any problem. It also runs automatically for published
 releases via the `Release verification` GitHub Actions workflow.
 

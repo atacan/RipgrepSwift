@@ -30,4 +30,25 @@ cancelled.cancel()
 let first = try await cancelled.makeAsyncIterator().next()
 precondition(first == nil, "cancelled search must end immediately")
 
+#if RIPGREP_VERIFY_GLOBS
+// 3. Require the new binary's traversal filtering and error mapping to work.
+let filteredOptions = RipgrepOptions(
+    includeGlobs: ["*.txt"], excludeGlobs: ["file1.txt", "file2.txt"]
+)
+var filteredCount = 0
+for try await match in Ripgrep.search("needle", in: root, options: filteredOptions) {
+    precondition(match.fileURL.lastPathComponent == "file0.txt")
+    filteredCount += 1
+}
+precondition(filteredCount == 20_000)
+do {
+    for try await _ in Ripgrep.search("needle", in: root, options: .init(includeGlobs: ["["])) {
+        preconditionFailure("invalid glob delivered a match")
+    }
+    preconditionFailure("invalid glob succeeded")
+} catch RipgrepError.invalidGlob(let message) {
+    precondition(message.contains("["))
+}
+#endif
+
 print("release consumer verification passed: consumed \(count) matches, cancellation clean")

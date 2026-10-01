@@ -16,15 +16,30 @@ public struct RipgrepOptions: Sendable {
     /// Match the pattern case-insensitively.
     public var caseInsensitive: Bool
 
+    /// Case-sensitive gitignore-style globs selecting eligible files (ORed).
+    /// Empty means all files. Relative to the root, or its parent for a file
+    /// root. Does not override ignore files or hidden-file handling.
+    public var includeGlobs: [String]
+
+    /// Case-sensitive globs excluding files/directories (ORed). Excludes win
+    /// over includes; matching directories are pruned before descent. Use a
+    /// trailing `/` to match directories only. Negation/comments/blank globs
+    /// are invalid; syntax errors throw `RipgrepError.invalidGlob` on iteration.
+    public var excludeGlobs: [String]
+
     public init(
         includeHidden: Bool = false,
         followSymbolicLinks: Bool = false,
         respectGitIgnore: Bool = true,
-        caseInsensitive: Bool = false
+        caseInsensitive: Bool = false,
+        includeGlobs: [String] = [],
+        excludeGlobs: [String] = []
     ) {
         self.includeHidden = includeHidden
         self.followSymbolicLinks = followSymbolicLinks
         self.respectGitIgnore = respectGitIgnore
         self.caseInsensitive = caseInsensitive
+        self.includeGlobs = includeGlobs
+        self.excludeGlobs = excludeGlobs
     }
 }

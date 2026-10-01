@@ -33,6 +33,22 @@ pub struct rg_search_options {
     pub case_insensitive: bool,
 }
 
+/// A borrowed UTF-8 byte range, valid for the synchronous search call only.
+#[repr(C)]
+pub struct rg_utf8_slice {
+    pub data: *const u8,
+    pub len: usize,
+}
+
+/// Optional path filters. The arrays and all their bytes are caller-owned.
+#[repr(C)]
+pub struct rg_glob_options {
+    pub includes: *const rg_utf8_slice,
+    pub includes_len: usize,
+    pub excludes: *const rg_utf8_slice,
+    pub excludes_len: usize,
+}
+
 /// Mirrors `rg_match_t` in ripgrep_ffi.h.
 ///
 /// `path` and `line` are borrowed and valid only inside the callback.
@@ -68,6 +84,7 @@ pub enum rg_status {
     RG_STATUS_INVALID_ARGUMENT = 2,
     RG_STATUS_INVALID_PATTERN = 3,
     RG_STATUS_IO_ERROR = 4,
+    RG_STATUS_INVALID_GLOB = 5,
     RG_STATUS_INTERNAL_ERROR = 255,
 }
 
@@ -75,6 +92,7 @@ impl From<&crate::error::SearchError> for rg_status {
     fn from(error: &crate::error::SearchError) -> Self {
         match error {
             crate::error::SearchError::InvalidPattern(_) => rg_status::RG_STATUS_INVALID_PATTERN,
+            crate::error::SearchError::InvalidGlob(_) => rg_status::RG_STATUS_INVALID_GLOB,
             crate::error::SearchError::Io(_) => rg_status::RG_STATUS_IO_ERROR,
         }
     }
@@ -175,6 +193,47 @@ pub unsafe extern "C" fn rg_search(
     progress_context: *mut std::ffi::c_void,
     error_message: *mut *mut c_char,
 ) -> rg_status {
+    // Preserve the original options layout and entry point for C consumers.
+    unsafe {
+        rg_search_with_globs(
+            root,
+            root_len,
+            pattern,
+            pattern_len,
+            options,
+            ptr::null(),
+            cancel_token,
+            callback,
+            context,
+            progress,
+            progress_context,
+            error_message,
+        )
+    }
+}
+
+/// Searches with optional include/exclude path globs.
+///
+/// # Safety
+/// The contracts of [`rg_search`] apply. `glob_options` may be null; otherwise
+/// its arrays must contain their stated number of valid `rg_utf8_slice`s.
+/// Each nonempty byte range must be readable for the duration of the call.
+/// Null pointers are accepted for zero-length arrays and byte ranges only.
+#[no_mangle]
+pub unsafe extern "C" fn rg_search_with_globs(
+    root: *const u8,
+    root_len: usize,
+    pattern: *const u8,
+    pattern_len: usize,
+    options: *const rg_search_options,
+    glob_options: *const rg_glob_options,
+    cancel_token: *const rg_cancel_token,
+    callback: rg_match_callback_t,
+    context: *mut std::ffi::c_void,
+    progress: rg_progress_callback_t,
+    progress_context: *mut std::ffi::c_void,
+    error_message: *mut *mut c_char,
+) -> rg_status {
     if let Some(slot) = unsafe { error_message.as_mut() } {
         *slot = ptr::null_mut();
     }
@@ -186,6 +245,7 @@ pub unsafe extern "C" fn rg_search(
             pattern,
             pattern_len,
             options,
+            glob_options,
             cancel_token,
             callback,
             context,
@@ -217,6 +277,7 @@ unsafe fn rg_search_impl(
     pattern: *const u8,
     pattern_len: usize,
     options: *const rg_search_options,
+    glob_options: *const rg_glob_options,
     cancel_token: *const rg_cancel_token,
     callback: rg_match_callback_t,
     context: *mut std::ffi::c_void,
@@ -245,11 +306,29 @@ unsafe fn rg_search_impl(
     };
 
     let opts = unsafe { &*options };
+    let (include_globs, exclude_globs) = if let Some(globs) = unsafe { glob_options.as_ref() } {
+        let includes = unsafe { decode_globs(globs.includes, globs.includes_len) };
+        let excludes = unsafe { decode_globs(globs.excludes, globs.excludes_len) };
+        match (includes, excludes) {
+            (Some(includes), Some(excludes)) => (includes, excludes),
+            _ => {
+                set_error_message(
+                    error_message,
+                    "invalid argument: glob arrays must contain valid UTF-8 byte ranges",
+                );
+                return rg_status::RG_STATUS_INVALID_ARGUMENT;
+            }
+        }
+    } else {
+        (Vec::new(), Vec::new())
+    };
     let search_options = SearchOptions {
         include_hidden: opts.include_hidden,
         follow_symlinks: opts.follow_symlinks,
         respect_gitignore: opts.respect_gitignore,
         case_insensitive: opts.case_insensitive,
+        include_globs,
+        exclude_globs,
     };
 
     // Checked non-null above.
@@ -310,11 +389,25 @@ fn decode_utf8(pointer: *const u8, length: usize) -> Option<String> {
     if length == 0 {
         return Some(String::new());
     }
-    if pointer.is_null() {
+    if pointer.is_null() || length > isize::MAX as usize {
         return None;
     }
     let bytes = unsafe { std::slice::from_raw_parts(pointer, length) };
     str::from_utf8(bytes).ok().map(str::to_owned)
+}
+
+/// Caller guarantees valid, aligned array storage for non-null pointers.
+unsafe fn decode_globs(pointer: *const rg_utf8_slice, length: usize) -> Option<Vec<String>> {
+    if length == 0 {
+        return Some(Vec::new());
+    }
+    if pointer.is_null() || length > isize::MAX as usize / size_of::<rg_utf8_slice>() {
+        return None;
+    }
+    unsafe { std::slice::from_raw_parts(pointer, length) }
+        .iter()
+        .map(|glob| decode_utf8(glob.data, glob.len))
+        .collect()
 }
 
 fn build_c_match(m: &SearchMatch<'_>) -> rg_match {

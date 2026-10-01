@@ -10,6 +10,8 @@ use std::fmt;
 pub enum SearchError {
     /// The regular expression failed to compile.
     InvalidPattern(String),
+    /// An explicit include/exclude glob is invalid.
+    InvalidGlob(String),
     /// A filesystem-level problem prevented the search from running
     /// (for example, a nonexistent search root).
     Io(String),
@@ -19,6 +21,7 @@ impl fmt::Display for SearchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SearchError::InvalidPattern(message) => write!(f, "invalid pattern: {message}"),
+            SearchError::InvalidGlob(message) => write!(f, "invalid glob: {message}"),
             SearchError::Io(message) => write!(f, "io error: {message}"),
         }
     }

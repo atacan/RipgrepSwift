@@ -95,16 +95,24 @@ if [[ -z "$LIBRARY" ]]; then
     exit 1
 fi
 echo "    $LIBRARY"
-for symbol in _rg_cancel_token_create _rg_cancel_token_cancel _rg_cancel_token_free; do
+# Keep historical 0.1.x verification available while requiring glob support
+# for source releases that call the new entry point.
+ABI_SYMBOLS=(_rg_cancel_token_create _rg_cancel_token_cancel _rg_cancel_token_free)
+BUILD_ARGS=("${CACHE_ARGS[@]}")
+if grep -q 'rg_search_with_globs' "$CHECKOUT/Sources/Ripgrep/Internal/SearchBridge.swift"; then
+    ABI_SYMBOLS+=(_rg_search_with_globs)
+    BUILD_ARGS+=(-Xswiftc -DRIPGREP_VERIFY_GLOBS)
+fi
+for symbol in "${ABI_SYMBOLS[@]}"; do
     if ! grep -aq -- "$symbol" "$LIBRARY"; then
         echo "FAIL: downloaded binary does not contain $symbol (outdated ABI)." >&2
         exit 1
     fi
 done
-echo "    rg_cancel_token_create/cancel/free present"
+echo "    required ABI symbols present"
 
 echo "==> swift build"
-swift build "${CACHE_ARGS[@]}"
+swift build "${BUILD_ARGS[@]}"
 
 echo "==> Running consumer executable (real search + cancellation)"
 "$WORK_DIR/.build/debug/Consumer"
