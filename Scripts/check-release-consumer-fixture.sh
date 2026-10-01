@@ -64,7 +64,8 @@ echo "==> Compiling + running release-consumer fixture against local XCFramework
     # artifact is required. SwiftPM requires the path to be relative to
     # the dependency package's root, exactly like Scripts/verify.sh.
     export RIPGREP_XCFRAMEWORK_PATH="Artifacts/CRipgrep.xcframework"
-    swift build --cache-path "$WORK_DIR/swiftpm-cache" --scratch-path "$WORK_DIR/.build"
+    swift build --cache-path "$WORK_DIR/swiftpm-cache" --scratch-path "$WORK_DIR/.build" \
+        -Xswiftc -DRIPGREP_VERIFY_GLOBS
     "$WORK_DIR/.build/debug/Consumer"
 )
 

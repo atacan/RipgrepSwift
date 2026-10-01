@@ -26,10 +26,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use grep_matcher::{Match, Matcher};
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{BinaryDetection, SearcherBuilder, Sink, SinkMatch};
+use ignore::overrides::{Override, OverrideBuilder};
 use ignore::WalkBuilder;
 
 /// Configuration for a single search run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchOptions {
     /// When true, hidden files and directories (dotfiles) are traversed.
     pub include_hidden: bool,
@@ -40,6 +41,10 @@ pub struct SearchOptions {
     pub respect_gitignore: bool,
     /// When true, the pattern matches case-insensitively.
     pub case_insensitive: bool,
+    /// ORed, root-relative file selectors; never override ignore/hidden rules.
+    pub include_globs: Vec<String>,
+    /// ORed exclusions; matching directories are pruned before descent.
+    pub exclude_globs: Vec<String>,
 }
 
 impl Default for SearchOptions {
@@ -49,6 +54,8 @@ impl Default for SearchOptions {
             follow_symlinks: false,
             respect_gitignore: true,
             case_insensitive: false,
+            include_globs: Vec::new(),
+            exclude_globs: Vec::new(),
         }
     }
 }
@@ -141,6 +148,8 @@ where
         .build(pattern)
         .map_err(|error| crate::error::SearchError::InvalidPattern(error.to_string()))?;
 
+    let globs = PathGlobs::new(root, &options)?;
+
     let mut searcher_builder = SearcherBuilder::new();
     searcher_builder.binary_detection(BinaryDetection::quit(b'\x00'));
     let mut searcher = searcher_builder.build();
@@ -154,6 +163,12 @@ where
         walker_builder.git_global(false);
         walker_builder.git_exclude(false);
         walker_builder.parents(false);
+    }
+    // Overrides attached directly to WalkBuilder would whitelist ignored or
+    // hidden files. An entry predicate narrows the existing traversal instead.
+    // The walker prunes rejected directories before loading their ignore files.
+    if !options.include_globs.is_empty() || !options.exclude_globs.is_empty() {
+        globs.apply_to(&mut walker_builder);
     }
 
     let cancelled_by_callback = Cell::new(false);
@@ -175,6 +190,11 @@ where
             continue;
         }
         let path: &Path = entry.path();
+        // ignore's serial walker bypasses filter_entry for explicitly supplied
+        // roots. Apply globs to a single-file root before opening it as well.
+        if entry.depth() == 0 && !globs.allows(path, false) {
+            continue;
+        }
         if path.to_str().is_none() {
             // Skip paths that are not valid UTF-8; documented v1 behavior.
             continue;
@@ -215,6 +235,117 @@ where
     } else {
         SearchOutcome::Completed
     })
+}
+
+/// Two positive override sets avoid last-match/negation precedence: any
+/// exclude wins and any include suffices. All parsing/matching stays native.
+#[derive(Clone)]
+struct PathGlobs {
+    includes: Override,
+    excludes: Override,
+    #[cfg(test)]
+    observed: Option<std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>>>,
+}
+
+impl PathGlobs {
+    fn new(root: &Path, options: &SearchOptions) -> Result<Self, crate::error::SearchError> {
+        let base = if root.is_file() {
+            root.parent().unwrap_or_else(|| Path::new("."))
+        } else {
+            root
+        };
+        Ok(Self {
+            includes: Self::compile(base, &options.include_globs, "include")?,
+            excludes: Self::compile(base, &options.exclude_globs, "exclude")?,
+            #[cfg(test)]
+            observed: None,
+        })
+    }
+
+    fn compile(
+        root: &Path,
+        patterns: &[String],
+        kind: &str,
+    ) -> Result<Override, crate::error::SearchError> {
+        let mut builder = OverrideBuilder::new(root);
+        for pattern in patterns {
+            let invalid = |message: String| {
+                crate::error::SearchError::InvalidGlob(format!("{kind} {pattern:?}: {message}"))
+            };
+            if pattern.trim().is_empty()
+                || pattern.starts_with(['!', '#'])
+                || pattern.contains(['\0', '\n', '\r'])
+            {
+                return Err(invalid(
+                    "expected a nonempty glob without negation, comments, NUL, or newlines".into(),
+                ));
+            }
+            builder
+                .add(pattern)
+                .map_err(|error| invalid(error.to_string()))?;
+        }
+        builder.build().map_err(|error| {
+            crate::error::SearchError::InvalidGlob(format!("{kind} globs: {error}"))
+        })
+    }
+
+    fn allows(&self, path: &Path, is_dir: bool) -> bool {
+        !self.excludes.matched(path, is_dir).is_whitelist()
+            && (is_dir
+                || self.includes.is_empty()
+                || self.includes.matched(path, false).is_whitelist())
+    }
+
+    fn apply_to(&self, builder: &mut WalkBuilder) {
+        let filter = self.clone();
+        builder.filter_entry(move |entry| {
+            #[cfg(test)]
+            if let Some(observed) = &filter.observed {
+                observed.lock().unwrap().push(entry.path().to_owned());
+            }
+            filter.allows(
+                entry.path(),
+                entry.file_type().is_some_and(|ft| ft.is_dir()),
+            )
+        });
+    }
+}
+
+#[cfg(test)]
+mod glob_traversal_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn excluded_directory_is_pruned_before_children_reach_the_filter() {
+        let root = tempfile::TempDir::new().unwrap();
+        let excluded = root.path().join("Generated");
+        std::fs::create_dir_all(excluded.join("deep")).unwrap();
+        std::fs::write(excluded.join("deep/a.swift"), "needle").unwrap();
+        std::fs::write(root.path().join("kept.swift"), "needle").unwrap();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let mut globs = PathGlobs::new(
+            root.path(),
+            &SearchOptions {
+                exclude_globs: vec!["Generated/".into()],
+                ..SearchOptions::default()
+            },
+        )
+        .unwrap();
+        globs.observed = Some(observed.clone());
+        let mut builder = WalkBuilder::new(root.path());
+        globs.apply_to(&mut builder);
+        let entries: Vec<_> = builder
+            .build()
+            .map(|entry| entry.unwrap().into_path())
+            .collect();
+        assert!(entries.contains(&root.path().join("kept.swift")));
+        let observed = observed.lock().unwrap();
+        assert!(observed.contains(&excluded));
+        assert!(!observed
+            .iter()
+            .any(|path| path != &excluded && path.starts_with(&excluded)));
+    }
 }
 
 struct CallbackSink<'a, 'b, M: Matcher, F> {

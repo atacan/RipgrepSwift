@@ -16,6 +16,25 @@ typedef struct rg_search_options {
     bool case_insensitive;
 } rg_search_options_t;
 
+/* Borrowed UTF-8 bytes. NULL is permitted only when len is zero. */
+typedef struct rg_utf8_slice {
+    const uint8_t *data;
+    size_t len;
+} rg_utf8_slice_t;
+
+/* Borrowed arrays and bytes, valid until rg_search_with_globs returns.
+ * NULL array pointers are permitted only for zero counts. Empty arrays
+ * preserve rg_search behavior. Patterns are ORed in each collection;
+ * excludes win and prune directories. Includes never override ignore or
+ * hidden rules. Patterns are relative to root (its parent for file roots).
+ * Syntax is case-sensitive gitignore-style without negation/comments. */
+typedef struct rg_glob_options {
+    const rg_utf8_slice_t *includes;
+    size_t includes_len;
+    const rg_utf8_slice_t *excludes;
+    size_t excludes_len;
+} rg_glob_options_t;
+
 /*
  * A single search result. The `path` and `line` buffers are borrowed:
  * they are only valid for the duration of the callback invocation that
@@ -63,6 +82,7 @@ typedef enum rg_status {
     RG_STATUS_INVALID_ARGUMENT = 2,
     RG_STATUS_INVALID_PATTERN = 3,
     RG_STATUS_IO_ERROR = 4,
+    RG_STATUS_INVALID_GLOB = 5,
     RG_STATUS_INTERNAL_ERROR = 255
 } rg_status_t;
 
@@ -130,6 +150,25 @@ rg_status_t rg_search(
     rg_progress_callback_t progress,
     void *progress_context,
 
+    char **error_message
+);
+
+/* Same ownership, callbacks, cancellation, and panic containment as
+ * rg_search. glob_options may be NULL for no filtering. Invalid syntax
+ * returns RG_STATUS_INVALID_GLOB; malformed byte ranges/UTF-8 return
+ * RG_STATUS_INVALID_ARGUMENT. No matches are delivered on glob errors. */
+rg_status_t rg_search_with_globs(
+    const uint8_t *root,
+    size_t root_len,
+    const uint8_t *pattern,
+    size_t pattern_len,
+    const rg_search_options_t *options,
+    const rg_glob_options_t *glob_options,
+    const rg_cancel_token_t *cancel_token,
+    rg_match_callback_t callback,
+    void *context,
+    rg_progress_callback_t progress,
+    void *progress_context,
     char **error_message
 );
 

@@ -433,3 +433,230 @@ fn progress_callback_reports_files_and_bytes() {
     );
     assert!(counters[1].load(Ordering::SeqCst) > 0, "bytes were counted");
 }
+
+// MARK: Borrowed glob configuration (original rg_search ABI stays intact)
+fn slices(patterns: &[&[u8]]) -> Vec<ripgrep_ffi::ffi::rg_utf8_slice> {
+    patterns
+        .iter()
+        .map(|p| ripgrep_ffi::ffi::rg_utf8_slice {
+            data: p.as_ptr(),
+            len: p.len(),
+        })
+        .collect()
+}
+fn run_glob_search(
+    root: &[u8],
+    globs: *const ripgrep_ffi::ffi::rg_glob_options,
+) -> (rg_status, usize, usize, usize, Option<String>) {
+    let counter = AtomicUsize::new(0);
+    let progress = [AtomicUsize::new(0), AtomicUsize::new(0)];
+    let mut error = ptr::null_mut();
+    let status = unsafe {
+        ripgrep_ffi::ffi::rg_search_with_globs(
+            root.as_ptr(),
+            root.len(),
+            b"needle".as_ptr(),
+            6,
+            &default_c_options(),
+            globs,
+            ptr::null(),
+            Some(counting_callback),
+            &counter as *const _ as *mut _,
+            Some(progress_callback),
+            &progress as *const _ as *mut _,
+            &mut error,
+        )
+    };
+    let message = if error.is_null() {
+        None
+    } else {
+        let message = unsafe { std::ffi::CStr::from_ptr(error) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { rg_free_string(error) };
+        Some(message)
+    };
+    (
+        status,
+        counter.load(Ordering::SeqCst),
+        progress[0].load(Ordering::SeqCst),
+        progress[1].load(Ordering::SeqCst),
+        message,
+    )
+}
+#[test]
+fn glob_ffi_borrowed_arrays_filter_and_prune_before_reads() {
+    use ripgrep_ffi::ffi::rg_glob_options;
+    let root = TempDir::new().unwrap();
+    std::fs::create_dir_all(root.path().join("Generated/deep")).unwrap();
+    for name in [
+        "日本 語.swift",
+        "lib.rs",
+        "skip.txt",
+        "Generated/deep/a.swift",
+    ] {
+        std::fs::write(root.path().join(name), "needle\n").unwrap();
+    }
+    let includes = slices(&[b"**/*.swift", b"**/*.rs"]);
+    let excludes = slices(&[b"Generated/", b"*.rs"]);
+    let globs = rg_glob_options {
+        includes: includes.as_ptr(),
+        includes_len: includes.len(),
+        excludes: excludes.as_ptr(),
+        excludes_len: excludes.len(),
+    };
+    let result = run_glob_search(root.path().as_os_str().as_bytes(), &globs);
+    assert_eq!(result, (rg_status::RG_STATUS_OK, 1, 1, 7, None));
+    assert_eq!(includes[0].len, b"**/*.swift".len());
+    assert_eq!(
+        run_glob_search(root.path().as_os_str().as_bytes(), &globs),
+        result
+    );
+}
+#[test]
+fn glob_ffi_null_options_and_empty_arrays_preserve_unfiltered_behavior() {
+    use ripgrep_ffi::ffi::rg_glob_options;
+    let root = TempDir::new().unwrap();
+    std::fs::write(root.path().join("a.swift"), "needle\n").unwrap();
+    std::fs::write(root.path().join("a.rs"), "needle\n").unwrap();
+    let globs = rg_glob_options {
+        includes: ptr::null(),
+        includes_len: 0,
+        excludes: ptr::null(),
+        excludes_len: 0,
+    };
+    let result = run_glob_search(root.path().as_os_str().as_bytes(), &globs);
+    assert_eq!(result, (rg_status::RG_STATUS_OK, 2, 2, 14, None));
+    assert_eq!(
+        run_glob_search(root.path().as_os_str().as_bytes(), ptr::null()),
+        result
+    );
+}
+#[test]
+fn glob_ffi_invalid_syntax_reports_new_status_and_freeable_message() {
+    use ripgrep_ffi::ffi::rg_glob_options;
+    let root = TempDir::new().unwrap();
+    std::fs::write(root.path().join("a.swift"), "needle").unwrap();
+    let invalid = slices(&[b"["]);
+    for exclude in [false, true] {
+        let mut globs = rg_glob_options {
+            includes: invalid.as_ptr(),
+            includes_len: 1,
+            excludes: ptr::null(),
+            excludes_len: 0,
+        };
+        if exclude {
+            globs.excludes = invalid.as_ptr();
+            globs.excludes_len = 1;
+            globs.includes = ptr::null();
+            globs.includes_len = 0;
+        }
+        let (status, matches, files, bytes, message) =
+            run_glob_search(root.path().as_os_str().as_bytes(), &globs);
+        assert_eq!(status, rg_status::RG_STATUS_INVALID_GLOB);
+        assert_eq!((matches, files, bytes), (0, 0, 0));
+        let message = message.unwrap();
+        assert!(message.contains(if exclude { "exclude" } else { "include" }));
+        assert!(message.contains('['));
+    }
+}
+#[test]
+fn glob_ffi_rejects_invalid_utf8_null_ranges_and_oversized_counts() {
+    use ripgrep_ffi::ffi::{rg_glob_options, rg_utf8_slice};
+    let root = TempDir::new().unwrap();
+    for invalid in [
+        rg_utf8_slice {
+            data: b"\xff".as_ptr(),
+            len: 1,
+        },
+        rg_utf8_slice {
+            data: ptr::null(),
+            len: 1,
+        },
+        rg_utf8_slice {
+            data: b"a".as_ptr(),
+            len: usize::MAX,
+        },
+    ] {
+        for exclude in [false, true] {
+            let globs = if exclude {
+                rg_glob_options {
+                    includes: ptr::null(),
+                    includes_len: 0,
+                    excludes: &invalid,
+                    excludes_len: 1,
+                }
+            } else {
+                rg_glob_options {
+                    includes: &invalid,
+                    includes_len: 1,
+                    excludes: ptr::null(),
+                    excludes_len: 0,
+                }
+            };
+            assert_eq!(
+                run_glob_search(root.path().as_os_str().as_bytes(), &globs).0,
+                rg_status::RG_STATUS_INVALID_ARGUMENT
+            );
+        }
+    }
+    for count in [1, usize::MAX] {
+        let globs = rg_glob_options {
+            includes: ptr::null(),
+            includes_len: count,
+            excludes: ptr::null(),
+            excludes_len: 0,
+        };
+        assert_eq!(
+            run_glob_search(root.path().as_os_str().as_bytes(), &globs).0,
+            rg_status::RG_STATUS_INVALID_ARGUMENT
+        );
+    }
+    let empty = rg_utf8_slice {
+        data: ptr::null(),
+        len: 0,
+    };
+    let globs = rg_glob_options {
+        includes: &empty,
+        includes_len: 1,
+        excludes: ptr::null(),
+        excludes_len: 0,
+    };
+    assert_eq!(
+        run_glob_search(root.path().as_os_str().as_bytes(), &globs).0,
+        rg_status::RG_STATUS_INVALID_GLOB
+    );
+}
+#[test]
+fn glob_ffi_filtered_search_retains_callback_cancellation() {
+    use ripgrep_ffi::ffi::rg_glob_options;
+    let root = TempDir::new().unwrap();
+    std::fs::write(root.path().join("a.swift"), "needle\n".repeat(1000)).unwrap();
+    let includes = slices(&[b"*.swift"]);
+    let globs = rg_glob_options {
+        includes: includes.as_ptr(),
+        includes_len: 1,
+        excludes: ptr::null(),
+        excludes_len: 0,
+    };
+    let mut error = ptr::null_mut();
+    let bytes = root.path().as_os_str().as_bytes();
+    let status = unsafe {
+        ripgrep_ffi::ffi::rg_search_with_globs(
+            bytes.as_ptr(),
+            bytes.len(),
+            b"needle".as_ptr(),
+            6,
+            &default_c_options(),
+            &globs,
+            ptr::null(),
+            Some(cancelling_callback),
+            ptr::null_mut(),
+            None,
+            ptr::null_mut(),
+            &mut error,
+        )
+    };
+    assert_eq!(status, rg_status::RG_STATUS_CANCELLED);
+    assert!(error.is_null());
+}

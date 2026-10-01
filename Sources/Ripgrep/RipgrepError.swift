@@ -6,6 +6,9 @@ public enum RipgrepError: Error, Sendable, Equatable {
     /// The regular expression could not be compiled.
     case invalidPattern(String)
 
+    /// An include or exclude path glob could not be compiled.
+    case invalidGlob(String)
+
     /// An input argument was unusable (for example a nonexistent or empty
     /// search root path).
     case invalidArgument(String)

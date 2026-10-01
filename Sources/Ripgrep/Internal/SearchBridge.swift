@@ -1,12 +1,12 @@
 import CRipgrep
 import Foundation
 
-/// Internal bridge between the public Swift API and the `rg_search` C ABI.
+/// Internal bridge between the public Swift API and the `rg_search_with_globs` C ABI.
 ///
 /// All unsafe interoperability lives in this file:
 ///
-/// * UTF-8 conversion of the root path and pattern;
-/// * population of `rg_search_options`;
+/// * UTF-8 conversion of the root path, pattern, and glob collections;
+/// * population of `rg_search_options` and borrowed `rg_glob_options`;
 /// * the `@convention(c)` match and progress callbacks, which copy borrowed
 ///   memory immediately (progress values are plain integers);
 /// * exact retain/release balancing for the callback context (`defer`);
@@ -48,19 +48,30 @@ enum SearchBridge {
         var errorMessage: UnsafeMutablePointer<CChar>?
         let status: rg_status = rootBytes.withUnsafeBufferPointer { rootBuffer in
             patternBytes.withUnsafeBufferPointer { patternBuffer in
-                rg_search(
-                    rootBuffer.baseAddress,
-                    rootBuffer.count,
-                    patternBuffer.baseAddress,
-                    patternBuffer.count,
-                    &cOptions,
-                    cancelToken,
-                    matchCallback,
-                    Unmanaged.passUnretained(context).toOpaque(),
-                    progressCallback,
-                    Unmanaged.passUnretained(context).toOpaque(),
-                    &errorMessage
-                )
+                withUTF8Slices(options.includeGlobs) { includes in
+                    withUTF8Slices(options.excludeGlobs) { excludes in
+                        var globs = rg_glob_options(
+                            includes: includes.baseAddress,
+                            includes_len: includes.count,
+                            excludes: excludes.baseAddress,
+                            excludes_len: excludes.count
+                        )
+                        return rg_search_with_globs(
+                            rootBuffer.baseAddress,
+                            rootBuffer.count,
+                            patternBuffer.baseAddress,
+                            patternBuffer.count,
+                            &cOptions,
+                            &globs,
+                            cancelToken,
+                            matchCallback,
+                            Unmanaged.passUnretained(context).toOpaque(),
+                            progressCallback,
+                            Unmanaged.passUnretained(context).toOpaque(),
+                            &errorMessage
+                        )
+                    }
+                }
             }
         }
 
@@ -70,6 +81,8 @@ enum SearchBridge {
             switch status {
             case RG_STATUS_INVALID_PATTERN:
                 throw RipgrepError.invalidPattern(message)
+            case RG_STATUS_INVALID_GLOB:
+                throw RipgrepError.invalidGlob(message)
             case RG_STATUS_INVALID_ARGUMENT:
                 throw RipgrepError.invalidArgument(message)
             case RG_STATUS_IO_ERROR:
@@ -86,6 +99,25 @@ enum SearchBridge {
             return
         default:
             throw RipgrepError.internalError("unexpected native status \(status.rawValue)")
+        }
+    }
+
+    /// One contiguous byte buffer per collection keeps every slice alive
+    /// throughout the synchronous native call, without recursive borrowing
+    /// or transferring ownership. Nothing is allocated per match here.
+    private static func withUTF8Slices<T>(
+        _ strings: [String],
+        _ body: (UnsafeBufferPointer<rg_utf8_slice>) -> T
+    ) -> T {
+        let lengths = strings.map { $0.utf8.count }
+        let bytes = strings.flatMap { Array($0.utf8) }
+        return bytes.withUnsafeBufferPointer { buffer in
+            var offset = 0
+            let slices = lengths.map { length in
+                defer { offset += length }
+                return rg_utf8_slice(data: buffer.baseAddress?.advanced(by: offset), len: length)
+            }
+            return slices.withUnsafeBufferPointer(body)
         }
     }
 
